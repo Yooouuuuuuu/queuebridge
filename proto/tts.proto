@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package streamservice;
+
+option go_package = "github.com/Yooouuuuuuu/queuebridge/proto";
+
+message TtsRequest {
+  string serviceName    = 1;  //必要，服務名稱
+  string text           = 2;  //必要，合成文字
+  string outfmt         = 3;  //輸出聲音格式，預設 mp3，支援 mp3, wav, pcm, pcm8(8K)
+  int64  vbr_quality    = 4;  //outfmt=mp3 時，音質設定，預設 4，0(好) ~ 9(差)
+  string language       = 5;  //主要語言，預設：zh-TW
+  bool   phrbrk         = 8;  //是否自動斷詞，預設：false
+  string speaker        = 10; //主要語言語者，預設 Sharon
+  float  speed          = 12; //主要語言語速，預設 1，範圍 0.5 ~ 2
+  float  gain           = 14; //主要語言聲音大小，預設 1，範圍 0.5 ~ 4
+  string token          = 23; //必要，賽微提供
+  string uid            = 24; //user unique id
+}
+
+message TtsResponse {
+  bytes data = 1;
+}
+
+service StreamService {
+  rpc TTS(TtsRequest) returns (stream TtsResponse) {};
+}

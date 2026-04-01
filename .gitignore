@@ -1,0 +1,26 @@
+# Binaries
+queuebridge
+*.exe
+
+# Test output
+test_output.wav
+*.wav
+*.mp3
+*.pcm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+
+# Debug
+__debug_bin*
