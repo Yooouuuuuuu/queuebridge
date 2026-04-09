@@ -1,5 +1,8 @@
-# Binaries
-queuebridge
+# Binaries (root-level compiled outputs)
+/queuebridge
+/sttdebug
+/wstest
+/main
 *.exe
 
 # Test output
@@ -7,6 +10,10 @@ test_output.wav
 *.wav
 *.mp3
 *.pcm
+
+# Generated testdata output (transcripts and synthesized audio)
+testdata/stt/output/*.txt
+testdata/tts/output/
 
 # IDE
 .idea/

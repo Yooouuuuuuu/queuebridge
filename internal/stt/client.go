@@ -18,25 +18,28 @@ const (
 
 // StartPayload is sent to begin recognition
 type StartPayload struct {
+	Action   string `json:"action"`
 	Domain   string `json:"domain"`
+	Platform string `json:"platform"`
+	UID      string `json:"uid"`
 	Type     string `json:"type"`
 	BIsDoEPD bool   `json:"bIsDoEPD"`
 	Token    string `json:"token"`
-	UID      string `json:"uid"`
 }
 
 // StopPayload is sent to end recognition
 type StopPayload struct {
-	Status string `json:"status"`
+	Action string `json:"action"`
 }
 
 // ServerMessage represents messages from the STT server
 type ServerMessage struct {
-	State   string `json:"state,omitempty"`
-	Text    string `json:"text,omitempty"`
-	Final   bool   `json:"final,omitempty"`
-	ErrCode int    `json:"err_code,omitempty"`
-	ErrMsg  string `json:"err_msg,omitempty"`
+	State       string `json:"state,omitempty"`
+	ErrCode     int    `json:"err_code,omitempty"`
+	ErrMsg      string `json:"err_msg,omitempty"`
+	// Result fields (state == "result")
+	RecogResult string `json:"recog_result,omitempty"`
+	IsFinish    bool   `json:"isFinish,omitempty"`
 }
 
 // ResultHandler is called when recognition results are received
@@ -146,11 +149,13 @@ func (c *Client) StartRecognition() error {
 	}
 
 	payload := StartPayload{
+		Action:   "start",
 		Domain:   c.domain,
+		Platform: "web",
+		UID:      c.uid,
 		Type:     DefaultAudioType,
 		BIsDoEPD: true,
 		Token:    c.token,
-		UID:      c.uid,
 	}
 
 	data, err := json.Marshal(payload)
@@ -215,7 +220,7 @@ func (c *Client) StopRecognition() error {
 		return fmt.Errorf("not connected")
 	}
 
-	payload := StopPayload{Status: "done"}
+	payload := StopPayload{Action: "stop"}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("failed to marshal stop payload: %w", err)
@@ -266,9 +271,9 @@ func (c *Client) ReadMessages(ctx context.Context) error {
 			continue
 		}
 
-		if msg.Text != "" {
+		if msg.State == "result" && msg.RecogResult != "" {
 			if c.onResult != nil {
-				c.onResult(msg.Text, msg.Final)
+				c.onResult(msg.RecogResult, msg.IsFinish)
 			}
 		}
 	}

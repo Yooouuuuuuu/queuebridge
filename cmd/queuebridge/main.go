@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/Yooouuuuuuu/queuebridge/config"
+	"github.com/Yooouuuuuuu/queuebridge/internal/gateway"
 	"github.com/Yooouuuuuuu/queuebridge/internal/stt"
 	"github.com/Yooouuuuuuu/queuebridge/internal/tts"
 )
@@ -16,11 +19,17 @@ func main() {
 	cfg := config.Load()
 
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: queuebridge <test-stt|test-tts|test-both>")
+		fmt.Println("Usage: queuebridge <serve|test-stt|test-tts|test-both>")
 		os.Exit(1)
 	}
 
 	switch os.Args[1] {
+	case "serve":
+		addr := ":8080"
+		if len(os.Args) > 2 {
+			addr = os.Args[2]
+		}
+		serveGateway(addr)
 	case "test-stt":
 		testSTT(cfg)
 	case "test-tts":
@@ -33,6 +42,18 @@ func main() {
 		fmt.Printf("Unknown command: %s\n", os.Args[1])
 		os.Exit(1)
 	}
+}
+
+func serveGateway(addr string) {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	cfg := config.Load()
+	gw := gateway.New(addr, *cfg)
+	if err := gw.Start(ctx); err != nil {
+		log.Fatalf("gateway error: %v", err)
+	}
+	log.Println("gateway stopped")
 }
 
 func testSTT(cfg *config.Config) {

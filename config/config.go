@@ -37,7 +37,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		STT: STTConfig{
 			Endpoint: "ws://10.1.8.174:8890/SttProxy/recognition",
-			Token:    getEnv("STT_TOKEN", ""),
+			Token:    getEnv("STT_TOKEN", "g9GzWBorWT9in7xIg79xhxWo9I3aNgczEPGsLNWFtX21sIoP7lFCOJ3JzZdiU0z7OV9Jt8mO-ZtVqfHH3N1RftmCKnehSkHdDur3-tz1hSo14JjGKrBIq2X8zbE69fHo"),
 			UID:      getEnv("STT_UID", "go-bridge-user"),
 			Domain:   "freeSTT-zh-TW",
 		},
