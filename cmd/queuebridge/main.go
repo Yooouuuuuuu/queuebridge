@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -29,10 +31,27 @@ func main() {
 	case "serve":
 		fs := flag.NewFlagSet("serve", flag.ExitOnError)
 		addr := fs.String("addr", ":8080", "listen address")
-		sttConns := fs.Int("stt", 0, "number of persistent STT WebSocket connections")
-		ttsConns := fs.Int("tts", 0, "number of persistent TTS gRPC connections")
+
+		// --pool name:service:protocol:conns  (repeatable)
+		var pools poolFlags
+		fs.Var(&pools, "pool", "pool definition: name:service:protocol:conns (repeatable)\n"+
+			"  e.g. --pool stt-a:stt:ws:2 --pool tts-a:tts:grpc:1")
+
+		// legacy shortcuts for convenience
+		sttConns := fs.Int("stt", 0, "shorthand: add a pool named 'stt-default' with N WebSocket workers")
+		ttsConns := fs.Int("tts", 0, "shorthand: add a pool named 'tts-default' with N gRPC workers")
+
 		fs.Parse(os.Args[2:])
-		serveGateway(*addr, *sttConns, *ttsConns)
+
+		if *sttConns > 0 {
+			pools = append(pools, broker.PoolConfig{Name: "stt-default", Service: "stt", Protocol: "ws", Conns: *sttConns})
+		}
+		if *ttsConns > 0 {
+			pools = append(pools, broker.PoolConfig{Name: "tts-default", Service: "tts", Protocol: "grpc", Conns: *ttsConns})
+		}
+
+		serveGateway(*addr, []broker.PoolConfig(pools))
+
 	case "test-stt":
 		testSTT(cfg)
 	case "test-tts":
@@ -47,15 +66,50 @@ func main() {
 	}
 }
 
-func serveGateway(addr string, sttConns, ttsConns int) {
-	log.Printf("[main] STT connections: %d  TTS connections: %d", sttConns, ttsConns)
+// poolFlags is a repeatable --pool flag.
+type poolFlags []broker.PoolConfig
+
+func (f *poolFlags) String() string {
+	parts := make([]string, len(*f))
+	for i, p := range *f {
+		parts[i] = fmt.Sprintf("%s:%s:%s:%d", p.Name, p.Service, p.Protocol, p.Conns)
+	}
+	return strings.Join(parts, ", ")
+}
+
+func (f *poolFlags) Set(v string) error {
+	parts := strings.SplitN(v, ":", 4)
+	if len(parts) != 4 {
+		return fmt.Errorf("pool flag must be name:service:protocol:conns, got %q", v)
+	}
+	conns, err := strconv.Atoi(parts[3])
+	if err != nil || conns <= 0 {
+		return fmt.Errorf("conns must be a positive integer, got %q", parts[3])
+	}
+	*f = append(*f, broker.PoolConfig{
+		Name:     parts[0],
+		Service:  parts[1],
+		Protocol: parts[2],
+		Conns:    conns,
+	})
+	return nil
+}
+
+func serveGateway(addr string, poolCfgs []broker.PoolConfig) {
+	if len(poolCfgs) == 0 {
+		log.Println("[main] no pools configured — use --pool or --stt/--tts flags")
+	}
+	for _, p := range poolCfgs {
+		log.Printf("[main] pool: %-12s  service=%-4s  protocol=%-5s  conns=%d",
+			p.Name, p.Service, p.Protocol, p.Conns)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	cfg := config.Load()
 
-	b := broker.New(*cfg, sttConns, ttsConns)
+	b := broker.New(*cfg, poolCfgs)
 	if err := b.Start(ctx); err != nil {
 		log.Fatalf("broker start: %v", err)
 	}
@@ -91,7 +145,6 @@ func testSTT(cfg *config.Config) {
 	fmt.Printf("  Connected: %v\n", client.IsConnected())
 	fmt.Printf("  Listening: %v\n", client.IsListening())
 
-	// Set up result handlers
 	client.OnResult(func(text string, isFinal bool) {
 		finalStr := "partial"
 		if isFinal {
@@ -104,7 +157,6 @@ func testSTT(cfg *config.Config) {
 		fmt.Printf("  [ERROR] code=%d msg=%s\n", code, msg)
 	})
 
-	// Start recognition
 	fmt.Println("Starting recognition...")
 	if err := client.StartRecognition(); err != nil {
 		log.Printf("Failed to start recognition: %v", err)
@@ -112,17 +164,12 @@ func testSTT(cfg *config.Config) {
 	}
 	fmt.Println("Recognition started - ready to receive audio")
 
-	// In a real scenario, you would send audio data here:
-	// client.SendAudio(pcmData) or client.SendAudioChunk(chunk)
-
-	// Stop recognition
 	fmt.Println("Stopping recognition...")
 	if err := client.StopRecognition(); err != nil {
 		log.Printf("Failed to stop recognition: %v", err)
 		return
 	}
 	fmt.Println("Recognition stopped")
-
 	fmt.Println("STT test completed successfully!")
 }
 
@@ -155,7 +202,6 @@ func testTTS(cfg *config.Config) {
 	fmt.Println("TTS connection SUCCESS")
 	fmt.Printf("  Connected: %v\n", client.IsConnected())
 
-	// Test synthesis
 	testText := "Hello, this is a test."
 	fmt.Printf("Synthesizing: %s\n", testText)
 
@@ -167,7 +213,6 @@ func testTTS(cfg *config.Config) {
 
 	fmt.Printf("TTS synthesis SUCCESS - received %d bytes of audio\n", len(audioData))
 
-	// Optionally save to file for verification
 	if len(os.Args) > 2 && os.Args[2] == "--save" {
 		outFile := "test_output.wav"
 		if err := os.WriteFile(outFile, audioData, 0644); err != nil {

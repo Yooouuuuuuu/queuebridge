@@ -16,24 +16,29 @@
 ## Broker Refactor
 
 ### Job model
-- [ ] Define generic `Job` struct with: `ID`, `Service`, `Pool`, `Priority`, `Source`, `Payload`, `ResultCh`
-- [ ] Replace `STTJob` / TTS direct call with unified `Submit(job Job)` entry point
-- [ ] Job payload typed per service (STT audio stream, TTS text, etc.)
+- [x] Define generic `Job` struct with: `Service`, `Pool`, `Priority`, `Payload`, `ResultCh`
+- [x] Replace `STTJob` / TTS direct call with unified `Submit(job Job)` entry point
+- [x] Job payload typed per service (STT audio stream, TTS text, etc.)
 
 ### Pool routing
-- [ ] Pool registry: map of service name → list of pools (e.g. `stt → [poolA, poolB]`)
-- [ ] Each pool has a name, protocol (ws/grpc/http), and N persistent workers
-- [ ] Client tag selects target pool directly, or leaves it empty for auto-routing
-- [ ] Auto-routing: pick least-loaded pool for the target service
+- [x] Pool registry: map of service name → list of pools (e.g. `stt → [poolA, poolB]`)
+- [x] Each pool has a name, protocol (ws/grpc/http), and N persistent workers
+- [x] Client tag selects target pool directly, or leaves it empty for auto-routing
+- [x] Auto-routing: pick least-loaded pool for the target service
 
 ### Priority queue
-- [ ] Replace `chan Job` with a priority queue (`container/heap` + mutex + `sync.Cond`)
-- [ ] Higher priority jobs dispatched first within the same pool
-- [ ] High-priority jobs with explicit pool tag bypass normal queue ordering
+- [x] Replace `chan Job` with a priority queue (`container/heap` + mutex + `sync.Cond`)
+- [x] Higher priority jobs dispatched first within the same pool
+- [ ] High-priority jobs with explicit pool tag bypass normal queue ordering (not yet tested)
 
 ### Submission
-- [ ] Blocking submit — no rejection; caller waits until a worker slot is free
+- [x] Blocking submit — no rejection; always enqueues
 - [ ] Optional per-job timeout: job cancelled if not picked up within N seconds
+
+### Bug to fix
+- [ ] Jobs get stuck retrying forever under heavy load (100/100 and 10/10 pool/workers
+      both reproduced) — suspect `ReadMessages` blocking on `<-readDone`, or audio drain
+      goroutine keeping `audioCh` open past session end
 
 ### Config
 - [ ] Pool definitions in config (name, service, protocol, endpoint, connections)

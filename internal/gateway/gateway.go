@@ -86,19 +86,38 @@ func (g *Gateway) handleTTS(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[gateway/tts] synthesizing: %q", req.Text)
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
-	defer cancel()
-
-	audioData, err := g.broker.Synthesize(ctx, req.Text)
-	if err != nil {
-		log.Printf("[gateway/tts] synthesis failed: %v", err)
-		http.Error(w, "TTS synthesis failed: "+err.Error(), http.StatusBadGateway)
+	resultCh := make(chan broker.Result, 1)
+	if err := g.broker.Submit(broker.Job{
+		Service:  "tts",
+		Payload:  &broker.TTSPayload{Text: req.Text},
+		ResultCh: resultCh,
+	}); err != nil {
+		log.Printf("[gateway/tts] submit failed: %v", err)
+		http.Error(w, "TTS not available: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
-	log.Printf("[gateway/tts] returning %d bytes of audio", len(audioData))
-	w.Header().Set("Content-Type", "audio/wav")
-	w.Write(audioData)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	select {
+	case res, ok := <-resultCh:
+		if !ok || res.ErrCode != 0 {
+			msg := res.ErrMsg
+			if !ok {
+				msg = "no result received"
+			}
+			log.Printf("[gateway/tts] synthesis failed: %s", msg)
+			http.Error(w, "TTS synthesis failed: "+msg, http.StatusBadGateway)
+			return
+		}
+		log.Printf("[gateway/tts] returning %d bytes of audio", len(res.Audio))
+		w.Header().Set("Content-Type", "audio/wav")
+		w.Write(res.Audio)
+	case <-ctx.Done():
+		log.Printf("[gateway/tts] request timed out")
+		http.Error(w, "TTS synthesis timed out", http.StatusGatewayTimeout)
+	}
 }
 
 // ---- STT WebSocket handler ----
@@ -137,13 +156,11 @@ func (g *Gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	var (
 		audioCh   chan []byte
-		resultCh  chan broker.STTResult
+		resultCh  chan broker.Result
 		audioOnce sync.Once
 		jobActive bool
 	)
 
-	// closeAudio closes audioCh exactly once, signalling the broker that the
-	// client has finished sending audio.
 	closeAudio := func() {
 		audioOnce.Do(func() {
 			if audioCh != nil {
@@ -156,8 +173,6 @@ func (g *Gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	for {
 		msgType, raw, err := conn.ReadMessage()
 		if err != nil {
-			// 1006 (abnormal closure) just means the client exited without
-			// sending a close frame — treat it the same as a clean disconnect.
 			log.Printf("[gateway/ws] client disconnected: %s (%v)", remoteAddr, err)
 			return
 		}
@@ -174,23 +189,25 @@ func (g *Gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			switch msg.Type {
 			case "start":
 				if jobActive {
-					continue // ignore duplicate start
+					continue
 				}
 
 				audioCh = make(chan []byte, 256)
-				resultCh = make(chan broker.STTResult, 32)
-				job := broker.STTJob{AudioCh: audioCh, ResultCh: resultCh}
+				resultCh = make(chan broker.Result, 32)
 
-				if err := g.broker.SubmitSTT(job); err != nil {
-					log.Printf("[gateway/ws] SubmitSTT: %v", err)
-					writeJSON(wsOutgoing{Type: "error", Msg: "server busy, try again later"})
-					return // close connection so client fails fast and retries
+				if err := g.broker.Submit(broker.Job{
+					Service:  "stt",
+					Payload:  &broker.STTPayload{AudioCh: audioCh},
+					ResultCh: resultCh,
+				}); err != nil {
+					log.Printf("[gateway/ws] Submit: %v", err)
+					writeJSON(wsOutgoing{Type: "error", Msg: err.Error()})
+					return
 				}
 
 				jobActive = true
-				log.Printf("[gateway/ws] STT session queued for %s", remoteAddr)
+				log.Printf("[gateway/ws] STT job submitted for %s", remoteAddr)
 
-				// Forward broker results to this WS client.
 				go func() {
 					for res := range resultCh {
 						if res.ErrCode != 0 {

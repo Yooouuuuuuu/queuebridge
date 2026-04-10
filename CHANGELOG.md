@@ -1,5 +1,37 @@
 # Changelog
 
+## [Unreleased]
+
+### Known issues
+- Jobs can get stuck retrying forever under heavy load (100/100 or 10/10 pool/workers);
+  root cause not yet confirmed — likely `ReadMessages` blocking on `<-readDone` or audio
+  drain goroutine keeping `audioCh` open
+
+---
+
+## [0.3.0] — 2026-04-10 — Broker Refactor
+
+### Added
+- Generic `Job` / `STTPayload` / `TTSPayload` / `Result` types replace `STTJob` / `STTResult`
+- Named pool registry: `--pool name:service:protocol:conns` (repeatable flag)
+- Priority queue per pool (`container/heap` + `sync.Cond`): 0–9 priority, higher dispatched
+  first; FIFO tiebreaker within same priority
+- Blocking submit — `Submit()` always enqueues, never rejects
+- Least-loaded auto-routing when `job.Pool` is empty
+- Per-pool status log every 10s: workers / active / queued
+- `--stt N` / `--tts N` kept as convenience shortcuts
+
+### Fixed
+- Panic: `send on closed channel` in `OnResult` callback — added `<-readDone` to wait for
+  `ReadMessages` goroutine to stop before closing `ResultCh`
+- `proto/tts.pb.go` regenerated (corrupted by module rename sed)
+
+### Changed
+- `broker.Synthesize` / `broker.SubmitSTT` replaced by unified `broker.Submit(job Job)`
+- Gateway uses `broker.Result` instead of `broker.STTResult`
+
+---
+
 ## [Unreleased] — Broker Refactor
 
 ### Planned

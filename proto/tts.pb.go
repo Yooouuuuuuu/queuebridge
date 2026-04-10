@@ -212,7 +212,7 @@ const file_proto_tts_proto_rawDesc = "" +
 	"\vTtsResponse\x12\x12\n" +
 	"\x04data\x18\x01 \x01(\fR\x04data2Q\n" +
 	"\rStreamService\x12@\n" +
-	"\x03TTS\x12\x19.streamservice.TtsRequest\x1a\x1a.streamservice.TtsResponse\"\x000\x01B*Z(github.com/Yooouuuuuuu/flowdispatch/protob\x06proto3"
+	"\x03TTS\x12\x19.streamservice.TtsRequest\x1a\x1a.streamservice.TtsResponse\"\x000\x01B*Z(github.com/Yooouuuuuuu/queuebridge/protob\x06proto3"
 
 var (
 	file_proto_tts_proto_rawDescOnce sync.Once
