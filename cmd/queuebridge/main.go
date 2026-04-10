@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Yooouuuuuuu/queuebridge/config"
+	"github.com/Yooouuuuuuu/queuebridge/internal/broker"
 	"github.com/Yooouuuuuuu/queuebridge/internal/gateway"
 	"github.com/Yooouuuuuuu/queuebridge/internal/stt"
 	"github.com/Yooouuuuuuu/queuebridge/internal/tts"
@@ -25,11 +27,12 @@ func main() {
 
 	switch os.Args[1] {
 	case "serve":
-		addr := ":8080"
-		if len(os.Args) > 2 {
-			addr = os.Args[2]
-		}
-		serveGateway(addr)
+		fs := flag.NewFlagSet("serve", flag.ExitOnError)
+		addr := fs.String("addr", ":8080", "listen address")
+		sttConns := fs.Int("stt", 0, "number of persistent STT WebSocket connections")
+		ttsConns := fs.Int("tts", 0, "number of persistent TTS gRPC connections")
+		fs.Parse(os.Args[2:])
+		serveGateway(*addr, *sttConns, *ttsConns)
 	case "test-stt":
 		testSTT(cfg)
 	case "test-tts":
@@ -44,12 +47,20 @@ func main() {
 	}
 }
 
-func serveGateway(addr string) {
+func serveGateway(addr string, sttConns, ttsConns int) {
+	log.Printf("[main] STT connections: %d  TTS connections: %d", sttConns, ttsConns)
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	cfg := config.Load()
-	gw := gateway.New(addr, *cfg)
+
+	b := broker.New(*cfg, sttConns, ttsConns)
+	if err := b.Start(ctx); err != nil {
+		log.Fatalf("broker start: %v", err)
+	}
+
+	gw := gateway.New(addr, b)
 	if err := gw.Start(ctx); err != nil {
 		log.Fatalf("gateway error: %v", err)
 	}

@@ -11,8 +11,9 @@ test_output.wav
 *.mp3
 *.pcm
 
-# Generated testdata output (transcripts and synthesized audio)
+# Generated testdata output (transcripts, audio, and batch logs)
 testdata/stt/output/*.txt
+testdata/stt/output/*.log
 testdata/tts/output/
 
 # IDE
@@ -31,3 +32,6 @@ Thumbs.db
 
 # Debug
 __debug_bin*
+
+# Personal notes
+REMINDER.md

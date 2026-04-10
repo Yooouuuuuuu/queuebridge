@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -20,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -50,9 +52,18 @@ func main() {
 			log.Fatalf("stt: %v", err)
 		}
 		fmt.Println(transcript)
+		outPath := filepath.Join(sttOutputDir, time.Now().Format("20060102_150405")+"_stt.txt")
+		if err := os.WriteFile(outPath, []byte(transcript+"\n"), 0644); err != nil {
+			log.Printf("save transcript: %v", err)
+		} else {
+			fmt.Printf("saved → %s\n", outPath)
+		}
 
 	case "stt-batch":
-		runSTTBatch()
+		fs := flag.NewFlagSet("stt-batch", flag.ExitOnError)
+		workers := fs.Int("workers", 1, "concurrent STT sessions")
+		fs.Parse(os.Args[2:])
+		runSTTBatch(*workers)
 
 	case "tts":
 		if len(os.Args) < 3 {
@@ -152,17 +163,21 @@ func runSTT(wavPath string) (string, error) {
 		}
 	}
 
-	return strings.Join(finals, " "), nil
+	transcript := strings.Join(finals, " ")
+	if transcript == "" {
+		return "", fmt.Errorf("no transcript received (session rejected or timed out)")
+	}
+	return transcript, nil
 }
 
-func runSTTBatch() {
-	entries, err := os.ReadDir(sttInputDir)
+func runSTTBatch(workers int) {
+	dirEntries, err := os.ReadDir(sttInputDir)
 	if err != nil {
 		log.Fatalf("read input dir: %v", err)
 	}
 
 	var wavs []string
-	for _, e := range entries {
+	for _, e := range dirEntries {
 		if !e.IsDir() && strings.ToLower(filepath.Ext(e.Name())) == ".wav" {
 			wavs = append(wavs, filepath.Join(sttInputDir, e.Name()))
 		}
@@ -173,32 +188,79 @@ func runSTTBatch() {
 		return
 	}
 
-	fmt.Printf("processing %d WAV file(s)...\n", len(wavs))
-	ok, fail := 0, 0
+	if workers < 1 {
+		workers = 1
+	}
+	fmt.Printf("processing %d WAV file(s) with %d concurrent worker(s)...\n", len(wavs), workers)
+
+	batchStart := time.Now()
+	results := make([]batchEntry, len(wavs)) // indexed by position, safe without mutex
+
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
 
 	for i, path := range wavs {
-		base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-		outPath := filepath.Join(sttOutputDir, base+".txt")
-		fmt.Printf("[%d/%d] %s\n", i+1, len(wavs), filepath.Base(path))
+		wg.Add(1)
+		go func(i int, path string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
-		transcript, err := runSTT(path)
-		if err != nil {
-			fmt.Printf("  ERROR: %v\n", err)
-			fail++
-			continue
-		}
+			label := filepath.Base(path)
+			base := strings.TrimSuffix(label, filepath.Ext(label))
+			outPath := filepath.Join(sttOutputDir, base+".txt")
 
-		if err := os.WriteFile(outPath, []byte(transcript+"\n"), 0644); err != nil {
-			fmt.Printf("  WRITE ERROR: %v\n", err)
-			fail++
-			continue
-		}
+			fmt.Printf("[%d/%d] %s starting\n", i+1, len(wavs), label)
+			start := time.Now()
 
-		fmt.Printf("  → %s\n", outPath)
-		ok++
+			const maxRetries = 3
+			var transcript string
+			var err error
+			for attempt := range maxRetries {
+				if attempt > 0 {
+					wait := time.Duration(attempt) * 2 * time.Second
+					fmt.Printf("[%d/%d] retry %d/%d in %s\n", i+1, len(wavs), attempt, maxRetries-1, wait)
+					time.Sleep(wait)
+				}
+				transcript, err = runSTT(path)
+				if err == nil {
+					break
+				}
+				fmt.Printf("[%d/%d] attempt %d failed: %v\n", i+1, len(wavs), attempt+1, err)
+			}
+
+			end := time.Now()
+
+			if err != nil {
+				fmt.Printf("[%d/%d] ERROR (all retries exhausted): %v\n", i+1, len(wavs), err)
+				results[i] = batchEntry{i + 1, label, start, end, false, err.Error()}
+				return
+			}
+			if werr := os.WriteFile(outPath, []byte(transcript+"\n"), 0644); werr != nil {
+				fmt.Printf("[%d/%d] WRITE ERROR: %v\n", i+1, len(wavs), werr)
+				results[i] = batchEntry{i + 1, label, start, end, false, werr.Error()}
+				return
+			}
+			fmt.Printf("[%d/%d] done  → %s  (%.2fs)\n", i+1, len(wavs), outPath, end.Sub(start).Seconds())
+			results[i] = batchEntry{i + 1, label, start, end, true, outPath}
+		}(i, path)
 	}
 
+	wg.Wait()
+
+	ok, fail := 0, 0
+	for _, r := range results {
+		if r.OK {
+			ok++
+		} else {
+			fail++
+		}
+	}
 	fmt.Printf("\ndone: %d ok, %d failed\n", ok, fail)
+
+	logPath := filepath.Join(sttOutputDir, batchStart.Format("20060102_150405")+"_batch.log")
+	writeBatchLog(logPath, batchStart, results)
+	fmt.Printf("log  → %s\n", logPath)
 }
 
 // ---- TTS ----------------------------------------------------------------
@@ -251,16 +313,22 @@ func runTTSBatch() {
 	}
 
 	fmt.Printf("synthesizing %d sentence(s)...\n", len(lines))
+	batchStart := time.Now()
+	var entries []batchEntry
 	ok, fail := 0, 0
 
 	for i, text := range lines {
 		outPath := filepath.Join(ttsOutputDir, fmt.Sprintf("%04d.wav", i+1))
 		fmt.Printf("[%d/%d] %s\n", i+1, len(lines), text)
 
+		start := time.Now()
+
 		body, _ := json.Marshal(map[string]string{"text": text})
 		resp, err := http.Post("http://"+gatewayAddr+"/tts", "application/json", bytes.NewReader(body))
 		if err != nil {
+			end := time.Now()
 			fmt.Printf("  ERROR: %v\n", err)
+			entries = append(entries, batchEntry{i + 1, text, start, end, false, err.Error()})
 			fail++
 			continue
 		}
@@ -268,7 +336,9 @@ func runTTSBatch() {
 		if resp.StatusCode != http.StatusOK {
 			msg, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			end := time.Now()
 			fmt.Printf("  ERROR %d: %s\n", resp.StatusCode, msg)
+			entries = append(entries, batchEntry{i + 1, text, start, end, false, fmt.Sprintf("HTTP %d", resp.StatusCode)})
 			fail++
 			continue
 		}
@@ -276,22 +346,79 @@ func runTTSBatch() {
 		audio, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
+			end := time.Now()
 			fmt.Printf("  READ ERROR: %v\n", err)
+			entries = append(entries, batchEntry{i + 1, text, start, end, false, err.Error()})
 			fail++
 			continue
 		}
 
 		if err := os.WriteFile(outPath, audio, 0644); err != nil {
+			end := time.Now()
 			fmt.Printf("  WRITE ERROR: %v\n", err)
+			entries = append(entries, batchEntry{i + 1, text, start, end, false, err.Error()})
 			fail++
 			continue
 		}
 
+		end := time.Now()
 		fmt.Printf("  → %s (%d bytes)\n", outPath, len(audio))
+		entries = append(entries, batchEntry{i + 1, text, start, end, true, outPath})
 		ok++
 	}
 
 	fmt.Printf("\ndone: %d ok, %d failed\n", ok, fail)
+
+	logPath := filepath.Join(ttsOutputDir, batchStart.Format("20060102_150405")+"_batch.log")
+	writeBatchLog(logPath, batchStart, entries)
+	fmt.Printf("log  → %s\n", logPath)
+}
+
+// ---- Batch timing log ---------------------------------------------------
+
+type batchEntry struct {
+	Index int
+	Label string    // filename (STT) or text snippet (TTS)
+	Start time.Time
+	End   time.Time
+	OK    bool
+	Note  string // output path on success, error message on failure
+}
+
+func writeBatchLog(path string, batchStart time.Time, entries []batchEntry) {
+	f, err := os.Create(path)
+	if err != nil {
+		fmt.Printf("  LOG ERROR: %v\n", err)
+		return
+	}
+	defer f.Close()
+
+	total := len(entries)
+	ok := 0
+	for _, e := range entries {
+		if e.OK {
+			ok++
+		}
+	}
+	batchEnd := time.Now()
+
+	fmt.Fprintf(f, "Batch run:  %s\n", batchStart.Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(f, "Completed:  %s\n", batchEnd.Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(f, "Duration:   %s\n", batchEnd.Sub(batchStart).Round(time.Millisecond))
+	fmt.Fprintf(f, "Total:      %d items, %d ok, %d failed\n\n", total, ok, total-ok)
+
+	for _, e := range entries {
+		dur := e.End.Sub(e.Start).Round(time.Millisecond)
+		status := "OK"
+		if !e.OK {
+			status = "FAIL"
+		}
+		fmt.Fprintf(f, "[%02d] %s\n", e.Index, e.Label)
+		fmt.Fprintf(f, "     start:    %s\n", e.Start.Format("15:04:05.000"))
+		fmt.Fprintf(f, "     end:      %s\n", e.End.Format("15:04:05.000"))
+		fmt.Fprintf(f, "     duration: %s\n", dur)
+		fmt.Fprintf(f, "     status:   %s  %s\n\n", status, e.Note)
+	}
 }
 
 // ---- WAV parsing --------------------------------------------------------
