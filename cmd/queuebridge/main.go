@@ -10,11 +10,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/Yooouuuuuuu/queuebridge/config"
-	"github.com/Yooouuuuuuu/queuebridge/internal/broker"
-	"github.com/Yooouuuuuuu/queuebridge/internal/gateway"
-	"github.com/Yooouuuuuuu/queuebridge/internal/stt"
-	"github.com/Yooouuuuuuu/queuebridge/internal/tts"
+	"github.com/Yooouuuuuuu/flowdispatch/config"
+	"github.com/Yooouuuuuuu/flowdispatch/internal/broker"
+	"github.com/Yooouuuuuuu/flowdispatch/internal/gateway"
+	"github.com/Yooouuuuuuu/flowdispatch/internal/stt"
+	"github.com/Yooouuuuuuu/flowdispatch/internal/tts"
 )
 
 func main() {

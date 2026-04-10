@@ -10,9 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Yooouuuuuuu/queuebridge/config"
-	"github.com/Yooouuuuuuu/queuebridge/internal/stt"
-	"github.com/Yooouuuuuuu/queuebridge/internal/tts"
+	"github.com/Yooouuuuuuu/flowdispatch/config"
+	"github.com/Yooouuuuuuu/flowdispatch/internal/stt"
+	"github.com/Yooouuuuuuu/flowdispatch/internal/tts"
 )
 
 const jobQueueCap = 8

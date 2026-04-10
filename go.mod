@@ -1,4 +1,4 @@
-module github.com/Yooouuuuuuu/queuebridge
+module github.com/Yooouuuuuuu/flowdispatch
 
 go 1.24.0
 

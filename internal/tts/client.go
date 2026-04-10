@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	pb "github.com/Yooouuuuuuu/queuebridge/proto"
+	pb "github.com/Yooouuuuuuu/flowdispatch/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )

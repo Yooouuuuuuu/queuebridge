@@ -18,7 +18,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/Yooouuuuuuu/queuebridge/config"
+	"github.com/Yooouuuuuuu/flowdispatch/config"
 	"github.com/gorilla/websocket"
 )
 

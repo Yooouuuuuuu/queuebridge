@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Yooouuuuuuu/queuebridge/internal/broker"
+	"github.com/Yooouuuuuuu/flowdispatch/internal/broker"
 	"github.com/gorilla/websocket"
 )
 
