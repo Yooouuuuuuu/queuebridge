@@ -1,4 +1,4 @@
-# QueueBridge
+# FlowDispatch
 
 A Go-based job routing broker that accepts requests from clients, queues them with priority, and dispatches them across persistent connection pools to multiple backend services.
 
