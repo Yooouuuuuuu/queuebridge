@@ -1,82 +1,112 @@
 # FlowDispatch
 
-A Go-based job routing broker that accepts requests from clients, queues them with priority, and dispatches them across persistent connection pools to multiple backend services.
+A Go broker that accepts requests from clients, queues them with priority, and dispatches them across persistent connection pools to backend AI services.
 
 ## Overview
 
-QueueBridge sits between clients and a set of backend services. Each job carries a tag describing its service type, priority, and optionally a target pool. The broker routes jobs through two layers:
+FlowDispatch sits between clients and a set of backend services. Each job carries a service type, priority, and optional target pool. The broker routes jobs through two layers:
 
-1. **Service queue** — jobs are grouped by service type (STT, TTS, …) and ordered mostly FIFO, with priority for jobs that carry a higher-priority tag
-2. **Pool selection** — within each service, there may be multiple backend pools; who decides which pool handles a job (client tag, load-balancing, priority rule) is configurable and still being designed
+1. **Service queue** — jobs are grouped by service type (STT, TTS, …) and ordered FIFO with optional priority
+2. **Pool dispatch** — N persistent backend connections per pool; the broker keeps each connection continuously busy, cycling through queued jobs one at a time
 
 ```
-                                    ┌─────────────────────────────────────────────┐
-                                    │              QueueBridge                    │
-                                    │                                             │
-                                    │  ┌─ STT queue ─┐   ┌── Pool A ──┐          │
-Clients          Gateway            │  │  (FIFO +    │──►│ N workers  ├──► ws    │
-───────          ───────            │  │  priority)  │   └────────────┘          │
-HTTP    ──┐                         │  │             │──►┌── Pool B ──┐          │
-WebSocket─┼──► normalize ──► route ─┤  │             │   │ N workers  ├──► ws    │
-gRPC    ──┘      + tag              │  └─────────────┘   └────────────┘          │
-                                    │                       ↑ who decides?        │
-                                    │                  (client tag / algo / rule) │
-                                    │                                             │
-                                    │  ┌─ TTS queue ─┐   ┌── Pool D ──┐          │
-                                    │  │  (FIFO +    │──►│ N workers  ├──► grpc  │
-                                    │  │  priority)  │   └────────────┘          │
-                                    │  │             │──►┌── Pool E ──┐          │
-                                    │  │             │   │ N workers  ├──► grpc  │
-                                    │  └─────────────┘   └────────────┘          │
-                                    │                                             │
-                                    │  ┌─ ??? queue ─┐   ┌── Pool F ──┐          │
-                                    │  │             │──►│ N workers  ├──► http  │
-                                    │  └─────────────┘   └────────────┘          │
-                                    └─────────────────────────────────────────────┘
+                                 ┌──────────────────────────────────────────────┐
+                                 │                 FlowDispatch                 │
+                                 │                                              │
+                                 │  ┌─ STT queue ─┐   ┌── Pool A ───────────┐  │
+Clients        Gateway           │  │  (FIFO +    │──►│ conn 1 ──► ws       │  │
+───────        ───────           │  │  priority)  │   │ conn N ──► ws       │  │
+WebSocket ──┐                    │  │             │   └─────────────────────┘  │
+HTTP      ──┼──► route ──► queue─┤  │             │   ┌── Pool B ───────────┐  │
+(gRPC     ──┘    + tag           │  │             │──►│ conn 1 ──► ws       │  │
+ planned)                        │  │             │   │ conn N ──► ws       │  │
+                                 │  └─────────────┘   └─────────────────────┘  │
+                                 │                                              │
+                                 │  ┌─ TTS queue ─┐   ┌── Pool C ───────────┐  │
+                                 │  │  (FIFO +    │──►│ conn 1 ──► grpc     │  │
+                                 │  │  priority)  │   │ conn N ──► grpc     │  │
+                                 │  │             │   └─────────────────────┘  │
+                                 │  │             │   ┌── Pool D ───────────┐  │
+                                 │  │             │──►│ conn 1 ──► grpc     │  │
+                                 │  │             │   │ conn N ──► grpc     │  │
+                                 │  └─────────────┘   └─────────────────────┘  │
+                                 │                                              │
+                                 │  ┌─ ??? queue ─┐   ┌── Pool E ───────────┐  │
+                                 │  │  (FIFO +    │──►│ conn 1 ──► http     │  │
+                                 │  │  priority)  │   │ conn N ──► http     │  │
+                                 │  │             │   └─────────────────────┘  │
+                                 │  │             │   ┌── Pool F ───────────┐  │
+                                 │  │             │──►│ conn 1 ──► http     │  │
+                                 │  │             │   │ conn N ──► http     │  │
+                                 │  └─────────────┘   └─────────────────────┘  │
+                                 └──────────────────────────────────────────────┘
 ```
-
-Most jobs are FIFO within their service queue. Jobs can carry a priority tag to move ahead. Some jobs may specify a pool directly; others let the system decide based on load or rules.
 
 ### Connection philosophy
 
 **Backend connections (outbound) — always persistent.**
-For WebSocket and gRPC backends, connections are established at startup and kept alive for the lifetime of the process. The number of connections per pool is bounded by what the backend service authorizes or can handle — the service itself may have its own internal queue or concurrency limit (e.g. returning a "server busy" signal when saturated), so opening more connections than the service allows adds no throughput. HTTP backends are stateless and connect per-request.
+Connections are established at startup and kept alive for the process lifetime. Each connection processes one job at a time; the number of connections per pool is bounded by what the backend service allows.
 
-**Client connections (inbound) — determined by the client's type tag.**
-The client declares its type when connecting. The gateway uses this to decide how to treat the connection:
+**Client connections (inbound) — short-lived today, session-oriented planned.**
+Currently each WS connection handles one job: `start` → `ready` → audio → `stop` → results → `done`. Session-oriented types (e.g. `customer_service`) with persistent connections and pool affinity are on the roadmap.
 
-- `customer_service` (and similar session-oriented types) — connection is kept alive for the duration of the conversation. Session lifetime is unknown and may vary from minutes to hours; no idle timeout is applied. A heartbeat is used to detect dead connections. The gateway stores a session registry (`session_id → assigned pool`) to enforce pool affinity: all jobs from the same conversation are routed to the same backend pool, ensuring consistency (e.g. same STT model state across turns).
-- Other types — short-lived; the connection closes when the job is done.
+### WS job protocol
 
-This means a single conversation maps to one persistent inbound WS, and the gateway pins it to one backend pool for its lifetime.
+```
+client                    gateway                    broker / STT
+  │                          │                            │
+  │── {"type":"start"} ─────►│                            │
+  │                          │── Submit(job) ────────────►│
+  │                          │                     [queue wait]
+  │                          │◄── close(ReadyCh) ─────────│  session dequeued
+  │◄── {"type":"ready"} ─────│                            │
+  │                          │                            │
+  │── [audio chunks] ───────►│── SendAudioChunk ─────────►│
+  │── {"type":"stop"} ──────►│── close(audioCh) ─────────►│
+  │                          │                            │
+  │◄── {"type":"result"} ────│◄── ResultCh ───────────────│  partial / final
+  │◄── {"type":"done"} ──────│◄── close(ResultCh) ────────│  job complete
+```
+
+The `ready` signal is the key backpressure point: the client does not stream audio until the broker has assigned a live backend session to the job. This prevents audio from buffering during queue wait and ensures the STT session is active before the first byte arrives.
 
 ## Current State
 
-The prototype is running with two active backend services:
+| Service | Protocol | Connections | Status |
+|---------|----------|-------------|--------|
+| STT (Speech-to-Text) | WebSocket | configurable | working |
+| TTS (Text-to-Speech) | gRPC | configurable | working |
 
-| Service | Protocol | Status |
-|---------|----------|--------|
-| STT (Speech-to-Text) | WebSocket | working |
-| TTS (Text-to-Speech) | gRPC | working |
-
-The broker maintains persistent connections to both backends. Connection counts are configured at startup via CLI flags.
+## Quick Start
 
 ```bash
+# Start with 2 STT connections and 1 TTS connection (shorthand flags)
 go run ./cmd/queuebridge serve --stt 2 --tts 1
+
+# Or define pools explicitly (repeatable; name:service:protocol:conns)
+go run ./cmd/queuebridge serve --pool stt-a:stt:ws:2 --pool tts-a:tts:grpc:1
+
+# Single requests
+go run ./cmd/playground stt testdata/stt/input/example.wav
+go run ./cmd/playground tts "今天天氣真的很好"
+
+# Batch with N concurrent clients
+go run ./cmd/playground stt-batch -workers 20
+go run ./cmd/playground tts-batch
 ```
 
 ## Project Structure
 
 ```
-queuebridge/
+flowdispatch/
 ├── cmd/
-│   ├── queuebridge/main.go   # serve, test-stt, test-tts subcommands
-│   ├── playground/main.go    # manual test CLI (stt, tts, stt-batch, tts-batch)
-│   └── sttdebug/main.go      # direct STT backend debug tool
+│   ├── queuebridge/main.go   # serve subcommand; --pool / --stt / --tts flags
+│   ├── playground/main.go    # test CLI: stt, stt-batch, tts, tts-batch
+│   └── sttdebug/main.go      # direct STT backend debug tool (bypasses broker)
 ├── internal/
-│   ├── broker/broker.go      # persistent pools, job queue, worker dispatch
-│   ├── gateway/gateway.go    # inbound HTTP and WebSocket handlers
-│   ├── stt/client.go         # WebSocket STT client
+│   ├── broker/broker.go      # pool registry, priority queue, worker dispatch
+│   ├── gateway/gateway.go    # inbound WS and HTTP handlers
+│   ├── stt/client.go         # WebSocket STT client with ListeningCh lifecycle
 │   └── tts/client.go         # gRPC TTS client
 ├── config/config.go          # env-based configuration
 ├── proto/                    # TTS gRPC protobuf definitions
@@ -85,24 +115,9 @@ queuebridge/
     └── tts/input/            # sentence list for TTS batch testing
 ```
 
-## Quick Start
-
-```bash
-# Start the gateway (with 2 STT workers and 1 TTS connection)
-go run ./cmd/queuebridge serve --stt 2 --tts 1
-
-# Test single requests
-go run ./cmd/playground tts "今天天氣真的很好"
-go run ./cmd/playground stt testdata/stt/input/example.wav
-
-# Run batch with concurrent workers
-go run ./cmd/playground stt-batch -workers 20
-go run ./cmd/playground tts-batch
-```
-
 ## Tech Stack
 
 - **Language:** Go 1.24
 - **Inbound:** HTTP, WebSocket (gRPC planned)
-- **Outbound:** WebSocket, gRPC
-- **Queue:** In-memory priority queue (planned)
+- **Outbound:** WebSocket (STT), gRPC (TTS)
+- **Queue:** In-memory priority queue (`container/heap` + `sync.Cond`)

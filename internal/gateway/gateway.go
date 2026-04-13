@@ -154,6 +154,9 @@ func (g *Gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(wsOutgoing{Type: "connected"})
 
+	connCtx, connCancel := context.WithCancel(r.Context())
+	defer connCancel()
+
 	var (
 		audioCh   chan []byte
 		resultCh  chan broker.Result
@@ -194,11 +197,13 @@ func (g *Gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 				audioCh = make(chan []byte, 256)
 				resultCh = make(chan broker.Result, 32)
+				readyCh := make(chan struct{})
 
 				if err := g.broker.Submit(broker.Job{
 					Service:  "stt",
 					Payload:  &broker.STTPayload{AudioCh: audioCh},
 					ResultCh: resultCh,
+					ReadyCh:  readyCh,
 				}); err != nil {
 					log.Printf("[gateway/ws] Submit: %v", err)
 					writeJSON(wsOutgoing{Type: "error", Msg: err.Error()})
@@ -206,7 +211,17 @@ func (g *Gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				}
 
 				jobActive = true
-				log.Printf("[gateway/ws] STT job submitted for %s", remoteAddr)
+				log.Printf("[gateway/ws] STT job queued for %s", remoteAddr)
+
+				// Notify the client when the broker session picks up the job so
+				// it can start streaming audio without racing the queue wait.
+				go func() {
+					select {
+					case <-readyCh:
+						writeJSON(wsOutgoing{Type: "ready"})
+					case <-connCtx.Done():
+					}
+				}()
 
 				go func() {
 					for res := range resultCh {
@@ -216,6 +231,9 @@ func (g *Gateway) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 							writeJSON(wsOutgoing{Type: "result", Text: res.Text, Final: res.IsFinal})
 						}
 					}
+					// ResultCh closed = broker finished the job; tell the client so
+					// it exits immediately instead of waiting for a read deadline.
+					writeJSON(wsOutgoing{Type: "done"})
 				}()
 
 			case "stop":

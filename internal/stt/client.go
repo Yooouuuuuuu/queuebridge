@@ -55,12 +55,17 @@ type Client struct {
 	uid      string
 	domain   string
 
-	conn          *websocket.Conn
-	mu            sync.Mutex
-	connected     bool
-	listening     bool
-	onResult      ResultHandler
-	onError       ErrorHandler
+	conn      *websocket.Conn
+	mu        sync.Mutex
+	connected bool
+	listening bool
+	onResult  ResultHandler
+	onError   ErrorHandler
+
+	// listeningCh is closed when the server sends {"state":"listening"}.
+	// StartRecognition resets it; Connect pre-closes it (already listening after handshake).
+	listeningMu sync.Mutex
+	listeningCh chan struct{}
 }
 
 // Config holds STT client configuration
@@ -136,6 +141,12 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	c.connected = true
 	c.listening = true
+
+	// Pre-close the channel: the handshake already confirmed the server is in listening state.
+	ch := make(chan struct{})
+	close(ch)
+	c.listeningCh = ch
+
 	return nil
 }
 
@@ -147,6 +158,12 @@ func (c *Client) StartRecognition() error {
 	if !c.connected {
 		return fmt.Errorf("not connected")
 	}
+
+	// Reset the listening channel so the next ListeningCh() call blocks until
+	// the server sends {"state":"listening"} after this session's stop.
+	c.listeningMu.Lock()
+	c.listeningCh = make(chan struct{})
+	c.listeningMu.Unlock()
 
 	payload := StartPayload{
 		Action:   "start",
@@ -236,6 +253,19 @@ func (c *Client) StopRecognition() error {
 // ReadMessages reads messages from the server in a loop
 // This should be called in a goroutine after Connect()
 func (c *Client) ReadMessages(ctx context.Context) error {
+	// Reset any read deadline left by a previous cancelled session.
+	c.conn.SetReadDeadline(time.Time{})
+
+	// When ctx is cancelled, unblock any in-progress conn.ReadMessage() by
+	// setting an immediate deadline. Without this, ReadMessage blocks until
+	// the server sends something, making <-readDone hang indefinitely.
+	innerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		<-innerCtx.Done()
+		c.conn.SetReadDeadline(time.Now())
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -245,6 +275,9 @@ func (c *Client) ReadMessages(ctx context.Context) error {
 
 		_, msgBytes, err := c.conn.ReadMessage()
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err() // deadline was set by us due to cancellation
+			}
 			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
 				return nil
 			}
@@ -268,6 +301,18 @@ func (c *Client) ReadMessages(ctx context.Context) error {
 			c.mu.Lock()
 			c.listening = true
 			c.mu.Unlock()
+
+			// Unblock any caller waiting in ListeningCh().
+			c.listeningMu.Lock()
+			ch := c.listeningCh
+			c.listeningMu.Unlock()
+			if ch != nil {
+				select {
+				case <-ch: // already closed — no-op
+				default:
+					close(ch)
+				}
+			}
 			continue
 		}
 
@@ -306,6 +351,16 @@ func (c *Client) IsConnected() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.connected
+}
+
+// ListeningCh returns a channel that is closed when the server next enters the
+// listening state (i.e. it has finished processing the previous stop). The
+// channel is reset on each StartRecognition call; the initial channel after
+// Connect is pre-closed because the handshake already confirmed listening state.
+func (c *Client) ListeningCh() <-chan struct{} {
+	c.listeningMu.Lock()
+	defer c.listeningMu.Unlock()
+	return c.listeningCh
 }
 
 // IsListening returns whether server is in listening state

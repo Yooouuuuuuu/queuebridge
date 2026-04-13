@@ -20,11 +20,12 @@ import (
 
 // Job is the unified job descriptor for all services.
 type Job struct {
-	Service  string // "stt" | "tts"
-	Pool     string // target pool name; "" = auto-route (least-loaded)
-	Priority int    // 0 = normal, 9 = highest urgency
-	Payload  any    // *STTPayload | *TTSPayload
+	Service  string      // "stt" | "tts"
+	Pool     string      // target pool name; "" = auto-route (least-loaded)
+	Priority int         // 0 = normal, 9 = highest urgency
+	Payload  any         // *STTPayload | *TTSPayload
 	ResultCh chan Result
+	ReadyCh  chan struct{} // closed by broker when a session dequeues this job; nil = unused
 }
 
 // STTPayload carries an audio stream for an STT job.
@@ -132,7 +133,8 @@ func (pq *priorityQueue) len() int {
 type pool struct {
 	cfg    PoolConfig
 	queue  *priorityQueue
-	active atomic.Int32 // jobs currently running
+	active atomic.Int32 // sessions currently processing audio
+	idle   atomic.Int32 // sessions connected and waiting for a job
 }
 
 // ---- Broker ----
@@ -274,113 +276,238 @@ func (b *Broker) dialSTT(ctx context.Context, poolName string) (*stt.Client, err
 	}
 }
 
+// runSTTWorker keeps a persistent STT session alive for this pool slot.
+// StartRecognition is called once per job, just before streaming begins.
+// On connection drop or StartRecognition failure, it reconnects.
 func (b *Broker) runSTTWorker(ctx context.Context, p *pool, cli *stt.Client) {
-	defer cli.Close()
 	for {
-		job, ok := p.queue.pop(ctx)
-		if !ok {
+		dropped := b.runArmedSession(ctx, p, cli)
+		cli.Close()
+		if !dropped || ctx.Err() != nil {
+			return
+		}
+		log.Printf("[broker] pool=%s  STT reconnecting…", p.cfg.Name)
+		var err error
+		cli, err = b.dialSTT(ctx, p.cfg.Name)
+		if err != nil {
 			return // ctx cancelled
 		}
-		dropped := b.processSTTSession(ctx, p, cli, job)
-		if dropped {
-			cli.Close()
-			var err error
-			cli, err = b.dialSTT(ctx, p.cfg.Name)
-			if err != nil {
-				return // ctx cancelled
-			}
-			log.Printf("[broker] pool=%s  STT reconnected", p.cfg.Name)
-		}
+		log.Printf("[broker] pool=%s  STT reconnected", p.cfg.Name)
 	}
 }
 
-func (b *Broker) processSTTSession(ctx context.Context, p *pool, cli *stt.Client, job Job) (connDropped bool) {
-	payload, ok := job.Payload.(*STTPayload)
-	if !ok {
-		log.Printf("[broker] pool=%s  unexpected STT payload type", p.cfg.Name)
-		close(job.ResultCh)
-		return false
-	}
-
-	p.active.Add(1)
-	defer p.active.Add(-1)
-
-	sessionDone := make(chan struct{})
-	var once sync.Once
-	signalDone := func() { once.Do(func() { close(sessionDone) }) }
+// runArmedSession manages the per-connection job loop. It signals idle when
+// waiting for a job, calls StartRecognition per job, and returns true if the
+// connection dropped and the caller should reconnect.
+func (b *Broker) runArmedSession(ctx context.Context, p *pool, cli *stt.Client) (connDropped bool) {
+	// cbMu + cbWg protect the per-job callbacks that ReadMessages fires.
+	// We swap them between jobs while ReadMessages keeps running on the same connection.
+	// cbWg ensures any in-flight callback finishes before we close job.ResultCh.
+	var (
+		cbMu     sync.Mutex
+		cbWg     sync.WaitGroup
+		cbResult func(string, bool)
+		cbError  func(int, string)
+	)
 
 	cli.OnResult(func(text string, isFinal bool) {
-		select {
-		case job.ResultCh <- Result{Text: text, IsFinal: isFinal}:
-		case <-sessionDone:
+		cbMu.Lock()
+		h := cbResult
+		if h != nil {
+			cbWg.Add(1)
 		}
-		if isFinal {
-			signalDone()
+		cbMu.Unlock()
+		if h != nil {
+			defer cbWg.Done()
+			h(text, isFinal)
 		}
 	})
 	cli.OnError(func(code int, msg string) {
-		select {
-		case job.ResultCh <- Result{ErrCode: code, ErrMsg: msg}:
-		case <-sessionDone:
+		cbMu.Lock()
+		h := cbError
+		if h != nil {
+			cbWg.Add(1)
+		}
+		cbMu.Unlock()
+		if h != nil {
+			defer cbWg.Done()
+			h(code, msg)
 		}
 	})
 
+	// Single persistent read loop for this connection's lifetime.
 	readCtx, cancelRead := context.WithCancel(ctx)
+	defer cancelRead()
 	connErrCh := make(chan error, 1)
 	readDone := make(chan struct{})
 	go func() {
 		defer close(readDone)
 		if err := cli.ReadMessages(readCtx); readCtx.Err() == nil && err != nil {
 			connErrCh <- err
-			signalDone()
 		}
 	}()
 
-	if err := cli.StartRecognition(); err != nil {
-		log.Printf("[broker] pool=%s  StartRecognition: %v", p.cfg.Name, err)
-		cancelRead()
-		<-readDone
-		close(job.ResultCh)
-		return true
+	p.idle.Add(1)
+	log.Printf("[broker] pool=%s  STT ready — idle: %d/%d", p.cfg.Name, p.idle.Load(), p.cfg.Conns)
+
+	// listeningCh tracks whether the STT server has returned to listening state.
+	// It is captured right after each StartRecognition call (which resets the
+	// channel internally), giving the server the entire job-processing window to
+	// send {"state":"listening"} before we need it for the next job.
+	// The initial value is pre-closed by Connect() (server was already listening).
+	listeningCh := cli.ListeningCh()
+
+	clearCallbacks := func(signalJobDone func()) {
+		// Close jobDone first so any blocked callback send unblocks via that path,
+		// then null out the callbacks and wait for any in-flight one to finish.
+		signalJobDone()
+		cbMu.Lock()
+		cbResult = nil
+		cbError = nil
+		cbMu.Unlock()
+		cbWg.Wait()
 	}
 
-	go func() {
-		for chunk := range payload.AudioCh {
-			if err := cli.SendAudioChunk(chunk); err != nil {
-				log.Printf("[broker] pool=%s  SendAudioChunk: %v", p.cfg.Name, err)
-				break
+	for {
+		job, ok := p.queue.pop(ctx)
+		if !ok {
+			p.idle.Add(-1)
+			cancelRead()
+			<-readDone
+			return false // ctx cancelled, clean exit
+		}
+
+		payload, ok := job.Payload.(*STTPayload)
+		if !ok {
+			log.Printf("[broker] pool=%s  unexpected STT payload type", p.cfg.Name)
+			close(job.ResultCh)
+			continue
+		}
+
+		p.idle.Add(-1)
+		p.active.Add(1)
+		log.Printf("[broker] pool=%s  STT job started — active: %d  idle: %d", p.cfg.Name, p.active.Load(), p.idle.Load())
+
+		// Wait for the server to confirm it is back in listening state.
+		// listeningCh was captured right after the previous StartRecognition, so
+		// the server has had the entire previous job's processing time to send
+		// {"state":"listening"}. In practice this select is instant on a busy queue.
+		select {
+		case <-listeningCh:
+			// server is ready
+		case err := <-connErrCh:
+			log.Printf("[broker] pool=%s  connection dropped waiting for listening state: %v", p.cfg.Name, err)
+			job.ResultCh <- Result{ErrCode: 1, ErrMsg: "connection lost before session start"}
+			close(job.ResultCh)
+			p.active.Add(-1)
+			cancelRead()
+			<-readDone
+			return true
+		case <-ctx.Done():
+			close(job.ResultCh)
+			p.active.Add(-1)
+			cancelRead()
+			<-readDone
+			return false
+		}
+
+		// Server is ready: tell the client it can start streaming.
+		if job.ReadyCh != nil {
+			close(job.ReadyCh)
+		}
+
+		if err := cli.StartRecognition(); err != nil {
+			log.Printf("[broker] pool=%s  StartRecognition: %v", p.cfg.Name, err)
+			// Notify the client immediately so it fails fast and retries,
+			// rather than streaming audio into a void and waiting for the deadline.
+			job.ResultCh <- Result{ErrCode: 1, ErrMsg: "recognition session failed: " + err.Error()}
+			close(job.ResultCh)
+			p.active.Add(-1)
+			cancelRead()
+			<-readDone
+			return true
+		}
+		// Capture the new channel immediately after StartRecognition resets it.
+		// The server now has the entire duration of this job to send {"state":"listening"},
+		// so the wait at the top of the next iteration is typically instant.
+		listeningCh = cli.ListeningCh()
+
+		jobDone := make(chan struct{})
+		var jOnce sync.Once
+		signalJobDone := func() { jOnce.Do(func() { close(jobDone) }) }
+
+		// Wire callbacks for this job.
+		cbMu.Lock()
+		cbResult = func(text string, isFinal bool) {
+			select {
+			case job.ResultCh <- Result{Text: text, IsFinal: isFinal}:
+			case <-jobDone:
+			}
+			if isFinal {
+				signalJobDone()
 			}
 		}
-		if err := cli.StopRecognition(); err != nil {
-			log.Printf("[broker] pool=%s  StopRecognition: %v", p.cfg.Name, err)
+		cbError = func(code int, msg string) {
+			select {
+			case job.ResultCh <- Result{ErrCode: code, ErrMsg: msg}:
+			case <-jobDone:
+			}
 		}
-	}()
+		cbMu.Unlock()
 
-	select {
-	case <-sessionDone:
-	case <-time.After(30 * time.Second):
-		log.Printf("[broker] pool=%s  STT session timed out", p.cfg.Name)
-	case <-ctx.Done():
-		cancelRead()
-		<-readDone
-		close(job.ResultCh)
-		return false
-	}
+		// Stream audio in background; StopRecognition when audioCh is drained.
+		// audioDone is closed only after StopRecognition completes.
+		audioDone := make(chan struct{})
+		go func() {
+			defer close(audioDone)
+			for chunk := range payload.AudioCh {
+				if err := cli.SendAudioChunk(chunk); err != nil {
+					log.Printf("[broker] pool=%s  SendAudioChunk: %v", p.cfg.Name, err)
+					break
+				}
+			}
+			if err := cli.StopRecognition(); err != nil {
+				log.Printf("[broker] pool=%s  StopRecognition: %v", p.cfg.Name, err)
+			}
+		}()
 
-	// Cancel the read loop and wait for it to stop before closing ResultCh.
-	// This prevents the OnResult/OnError callbacks (called from ReadMessages)
-	// from racing with close(ResultCh) and causing a send-on-closed panic.
-	cancelRead()
-	<-readDone
+		select {
+		case <-jobDone:
+			// Wait for StopRecognition to complete before looping. Without this,
+			// the next StartRecognition could race the in-flight stop on the wire.
+			<-audioDone
+			clearCallbacks(signalJobDone)
+			close(job.ResultCh)
+			p.active.Add(-1)
+			p.idle.Add(1)
+			log.Printf("[broker] pool=%s  STT idle — active: %d  idle: %d", p.cfg.Name, p.active.Load(), p.idle.Load())
 
-	select {
-	case err := <-connErrCh:
-		log.Printf("[broker] pool=%s  STT connection dropped: %v", p.cfg.Name, err)
-		close(job.ResultCh)
-		return true
-	default:
-		close(job.ResultCh)
-		return false
+		case <-time.After(30 * time.Second):
+			log.Printf("[broker] pool=%s  STT job timed out", p.cfg.Name)
+			clearCallbacks(signalJobDone)
+			close(job.ResultCh)
+			p.active.Add(-1)
+			cancelRead()
+			<-readDone
+			return true // treat timeout as drop; caller reconnects
+
+		case err := <-connErrCh:
+			log.Printf("[broker] pool=%s  STT connection dropped: %v", p.cfg.Name, err)
+			clearCallbacks(signalJobDone)
+			close(job.ResultCh)
+			p.active.Add(-1)
+			cancelRead()
+			<-readDone
+			return true
+
+		case <-ctx.Done():
+			clearCallbacks(signalJobDone)
+			close(job.ResultCh)
+			p.active.Add(-1)
+			cancelRead()
+			<-readDone
+			return false
+		}
 	}
 }
 
@@ -434,8 +561,8 @@ func (b *Broker) runStatusLogger(ctx context.Context) {
 			return
 		case <-ticker.C:
 			for name, p := range b.pools {
-				log.Printf("[broker] pool=%-12s  workers=%d  active=%d  queued=%d",
-					name, p.cfg.Conns, p.active.Load(), p.queue.len())
+				log.Printf("[broker] pool=%-12s  conns=%d  active=%d  idle=%d  queued=%d",
+					name, p.cfg.Conns, p.active.Load(), p.idle.Load(), p.queue.len())
 			}
 		}
 	}

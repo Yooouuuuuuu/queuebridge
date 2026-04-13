@@ -1,11 +1,35 @@
 # Changelog
 
-## [Unreleased]
+## [0.4.0] — 2026-04-13 — Session Reliability & Backpressure
 
-### Known issues
-- Jobs can get stuck retrying forever under heavy load (100/100 or 10/10 pool/workers);
-  root cause not yet confirmed — likely `ReadMessages` blocking on `<-readDone` or audio
-  drain goroutine keeping `audioCh` open
+### Added
+- **Backpressure via `ReadyCh`**: broker closes `job.ReadyCh` when a session dequeues
+  the job; the gateway sends `{"type":"ready"}` to the client at that moment. Clients
+  wait for `ready` before streaming audio, so no audio is buffered during queue wait.
+- **`{"type":"done"}` from gateway**: sent when `ResultCh` closes (job fully complete).
+  Clients exit immediately instead of waiting for a read deadline — eliminated ~5 s of
+  dead time per file when workers were the throughput bottleneck.
+- **`ListeningCh()` on STT client**: returns a channel that is closed when the server
+  sends `{"state":"listening"}` after a session ends. Broker waits on this before each
+  `StartRecognition` to eliminate the stop/start race that caused silent rejections.
+- **`idle atomic.Int32` on pool**: tracks sessions waiting for a job; status ticker now
+  logs `conns / active / idle / queued`.
+
+### Fixed
+- **Silent STT session rejections under load**: `StartRecognition` was sent before the
+  server finished resetting the previous session (the server sends `{"state":"listening"}`
+  asynchronously after `isFinal`). Caused consistent failures for specific files across
+  all retry attempts. Fixed by `ListeningCh` wait before each `StartRecognition`.
+- **`ListeningCh` captured immediately after `StartRecognition`** (not at dequeue time):
+  the server now has the entire job-processing window to send `listening`; the wait is
+  near-instant on a busy queue instead of blocking for the full server reset latency.
+
+### Changed
+- Removed `time.Sleep(chunkDuration)` from playground audio streaming — audio is now
+  sent at full speed. Batch throughput: 5 000 files with 2 connections in 5 m 29 s
+  (vs. minutes per hundred files before).
+- `runArmedSession` comment and log messages updated to reflect the simplified lifecycle
+  (no pre-arming, no re-arm after job).
 
 ---
 
@@ -29,19 +53,6 @@
 ### Changed
 - `broker.Synthesize` / `broker.SubmitSTT` replaced by unified `broker.Submit(job Job)`
 - Gateway uses `broker.Result` instead of `broker.STTResult`
-
----
-
-## [Unreleased] — Broker Refactor
-
-### Planned
-- Generic `Job` type with service tag, priority, and source metadata
-- Per-service pool registry: multiple pools per service type (e.g. STT pool A
-  and pool B on different backends); routing can be client-driven (tag
-  specifies pool) or system-driven (load-balancing algorithm)
-- Priority-aware queue: high-priority jobs skip ahead or pin to a specific pool
-- Blocking submission — no rejection; queue until a worker is free
-- README rewrite to reflect the general-purpose broker architecture
 
 ---
 
@@ -70,7 +81,7 @@
 
 ---
 
-## [Unreleased] - 2026-04-09
+## [0.1.0] — 2026-04-09 — Inbound Gateway & Playground
 
 ### Added
 - `internal/gateway`: inbound HTTP `/tts` and WebSocket `/ws` handlers
@@ -81,13 +92,14 @@
 - `testdata/tts/input/sentences.txt`: 514 Traditional Chinese sentences for TTS batch testing
 
 ### Changed
-- `internal/stt/client.go`: fixed protocol — added `action` and `platform` fields to start payload, changed stop payload to `{"action":"stop"}`
+- `internal/stt/client.go`: fixed protocol — added `action` and `platform` fields to
+  start payload, changed stop payload to `{"action":"stop"}`
 - `config/config.go`: added STT default token
 - `cmd/queuebridge/main.go`: added `serve` command, wires config into gateway
 
 ---
 
-## 2026-04-01 — connect to service apis
+## [0.0.2] — 2026-04-01 — Service API Clients
 
 ### Added
 - `internal/stt/client.go`: WebSocket STT client (connect, start/stop recognition, send audio, read messages)
@@ -100,8 +112,8 @@
 
 ---
 
-## 2026-03-26 — init: project structure
+## [0.0.1] — 2026-03-26 — Project Init
 
 ### Added
 - `README.md`: project overview and planned architecture
-- Scaffold files for `cmd/queuebridge`, `config`, `internal/gateway`, `internal/queue`, `internal/pool`, `internal/broker`
+- Scaffold: `cmd/queuebridge`, `config`, `internal/gateway`, `internal/queue`, `internal/pool`, `internal/broker`

@@ -47,13 +47,13 @@ func main() {
 			fmt.Fprintln(os.Stderr, "usage: playground stt <file.wav>")
 			os.Exit(1)
 		}
-		transcript, err := runSTT(os.Args[2])
+		res, err := runSTT(os.Args[2])
 		if err != nil {
 			log.Fatalf("stt: %v", err)
 		}
-		fmt.Println(transcript)
+		fmt.Println(res.transcript)
 		outPath := filepath.Join(sttOutputDir, time.Now().Format("20060102_150405")+"_stt.txt")
-		if err := os.WriteFile(outPath, []byte(transcript+"\n"), 0644); err != nil {
+		if err := os.WriteFile(outPath, []byte(res.transcript+"\n"), 0644); err != nil {
 			log.Printf("save transcript: %v", err)
 		} else {
 			fmt.Printf("saved → %s\n", outPath)
@@ -99,10 +99,16 @@ type wsMsg struct {
 	Msg   string `json:"msg,omitempty"`
 }
 
-func runSTT(wavPath string) (string, error) {
+// sttResult holds transcript and any server error codes seen during the session.
+type sttResult struct {
+	transcript string
+	errCodes   []int // non-zero error codes received from server (e.g. -11)
+}
+
+func runSTT(wavPath string) (sttResult, error) {
 	hdr, pcm, err := readWAV(wavPath)
 	if err != nil {
-		return "", fmt.Errorf("read wav: %w", err)
+		return sttResult{}, fmt.Errorf("read wav: %w", err)
 	}
 
 	fmt.Printf("  wav: %d Hz, %d ch, %d-bit, %.2fs\n",
@@ -116,36 +122,50 @@ func runSTT(wavPath string) (string, error) {
 
 	conn, _, err := websocket.DefaultDialer.Dial("ws://"+gatewayAddr+"/ws", nil)
 	if err != nil {
-		return "", fmt.Errorf("ws connect: %w", err)
+		return sttResult{}, fmt.Errorf("ws connect: %w", err)
 	}
 	defer conn.Close()
 
 	var msg wsMsg
 	if err := conn.ReadJSON(&msg); err != nil {
-		return "", fmt.Errorf("read welcome: %w", err)
+		return sttResult{}, fmt.Errorf("read welcome: %w", err)
 	}
 	if msg.Type != "connected" {
-		return "", fmt.Errorf("unexpected welcome: %+v", msg)
+		return sttResult{}, fmt.Errorf("unexpected welcome: %+v", msg)
 	}
 
 	send(conn, map[string]string{"type": "start"})
 
-	chunkDuration := time.Duration(float64(chunkSize) / float64(hdr.ByteRate) * float64(time.Second))
+	// Wait for the broker to signal that a session has picked up the job.
+	// This prevents streaming audio into a buffer while the job sits in queue —
+	// with N connections and many workers, the queue wait can exceed the read deadline.
+	conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+	var readyMsg wsMsg
+	if err := conn.ReadJSON(&readyMsg); err != nil {
+		return sttResult{}, fmt.Errorf("wait ready: %w", err)
+	}
+	if readyMsg.Type == "error" {
+		return sttResult{}, fmt.Errorf("session error while queued: %s", readyMsg.Msg)
+	}
+	if readyMsg.Type != "ready" {
+		return sttResult{}, fmt.Errorf("unexpected message (type=%s) while waiting for ready", readyMsg.Type)
+	}
+	conn.SetReadDeadline(time.Time{})
+
 	for i := 0; i < len(pcm); i += chunkSize {
 		end := i + chunkSize
 		if end > len(pcm) {
 			end = len(pcm)
 		}
 		if err := conn.WriteMessage(websocket.BinaryMessage, pcm[i:end]); err != nil {
-			return "", fmt.Errorf("send audio: %w", err)
+			return sttResult{}, fmt.Errorf("send audio: %w", err)
 		}
-		time.Sleep(chunkDuration)
 	}
 
 	send(conn, map[string]string{"type": "stop"})
 
 	conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	var finals []string
+	var res sttResult
 	for {
 		var m wsMsg
 		if err := conn.ReadJSON(&m); err != nil {
@@ -155,19 +175,31 @@ func runSTT(wavPath string) (string, error) {
 		case "result":
 			fmt.Printf("  [%s] %s\n", boolStr(m.Final, "FINAL", "partial"), m.Text)
 			if m.Final {
-				finals = append(finals, m.Text)
+				res.transcript += m.Text + " "
 				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			}
 		case "error":
 			fmt.Printf("  [error] code=%d %s\n", m.Code, m.Msg)
+			if m.Code != 0 {
+				res.errCodes = append(res.errCodes, m.Code)
+				// Fatal broker/session error — no transcript is coming; fail fast.
+				return res, fmt.Errorf("session error %d: %s", m.Code, m.Msg)
+			}
+		case "done":
+			// Broker signals the job is fully complete; no need to wait for deadline.
+			res.transcript = strings.TrimSpace(res.transcript)
+			if res.transcript == "" {
+				return res, fmt.Errorf("no transcript received (session rejected or timed out)")
+			}
+			return res, nil
 		}
 	}
 
-	transcript := strings.Join(finals, " ")
-	if transcript == "" {
-		return "", fmt.Errorf("no transcript received (session rejected or timed out)")
+	res.transcript = strings.TrimSpace(res.transcript)
+	if res.transcript == "" {
+		return res, fmt.Errorf("no transcript received (session rejected or timed out)")
 	}
-	return transcript, nil
+	return res, nil
 }
 
 func runSTTBatch(workers int) {
@@ -214,15 +246,17 @@ func runSTTBatch(workers int) {
 			start := time.Now()
 
 			const maxRetries = 3
-			var transcript string
+			var res sttResult
 			var err error
+			var retries int
 			for attempt := range maxRetries {
 				if attempt > 0 {
+					retries++
 					wait := time.Duration(attempt) * 2 * time.Second
 					fmt.Printf("[%d/%d] retry %d/%d in %s\n", i+1, len(wavs), attempt, maxRetries-1, wait)
 					time.Sleep(wait)
 				}
-				transcript, err = runSTT(path)
+				res, err = runSTT(path)
 				if err == nil {
 					break
 				}
@@ -233,16 +267,16 @@ func runSTTBatch(workers int) {
 
 			if err != nil {
 				fmt.Printf("[%d/%d] ERROR (all retries exhausted): %v\n", i+1, len(wavs), err)
-				results[i] = batchEntry{i + 1, label, start, end, false, err.Error()}
+				results[i] = batchEntry{i + 1, label, start, end, false, err.Error(), retries, res.errCodes}
 				return
 			}
-			if werr := os.WriteFile(outPath, []byte(transcript+"\n"), 0644); werr != nil {
+			if werr := os.WriteFile(outPath, []byte(res.transcript+"\n"), 0644); werr != nil {
 				fmt.Printf("[%d/%d] WRITE ERROR: %v\n", i+1, len(wavs), werr)
-				results[i] = batchEntry{i + 1, label, start, end, false, werr.Error()}
+				results[i] = batchEntry{i + 1, label, start, end, false, werr.Error(), retries, res.errCodes}
 				return
 			}
 			fmt.Printf("[%d/%d] done  → %s  (%.2fs)\n", i+1, len(wavs), outPath, end.Sub(start).Seconds())
-			results[i] = batchEntry{i + 1, label, start, end, true, outPath}
+			results[i] = batchEntry{i + 1, label, start, end, true, outPath, retries, res.errCodes}
 		}(i, path)
 	}
 
@@ -328,7 +362,7 @@ func runTTSBatch() {
 		if err != nil {
 			end := time.Now()
 			fmt.Printf("  ERROR: %v\n", err)
-			entries = append(entries, batchEntry{i + 1, text, start, end, false, err.Error()})
+			entries = append(entries, batchEntry{Index: i + 1, Label: text, Start: start, End: end, Note: err.Error()})
 			fail++
 			continue
 		}
@@ -338,7 +372,7 @@ func runTTSBatch() {
 			resp.Body.Close()
 			end := time.Now()
 			fmt.Printf("  ERROR %d: %s\n", resp.StatusCode, msg)
-			entries = append(entries, batchEntry{i + 1, text, start, end, false, fmt.Sprintf("HTTP %d", resp.StatusCode)})
+			entries = append(entries, batchEntry{Index: i + 1, Label: text, Start: start, End: end, Note: fmt.Sprintf("HTTP %d", resp.StatusCode)})
 			fail++
 			continue
 		}
@@ -348,7 +382,7 @@ func runTTSBatch() {
 		if err != nil {
 			end := time.Now()
 			fmt.Printf("  READ ERROR: %v\n", err)
-			entries = append(entries, batchEntry{i + 1, text, start, end, false, err.Error()})
+			entries = append(entries, batchEntry{Index: i + 1, Label: text, Start: start, End: end, Note: err.Error()})
 			fail++
 			continue
 		}
@@ -356,14 +390,14 @@ func runTTSBatch() {
 		if err := os.WriteFile(outPath, audio, 0644); err != nil {
 			end := time.Now()
 			fmt.Printf("  WRITE ERROR: %v\n", err)
-			entries = append(entries, batchEntry{i + 1, text, start, end, false, err.Error()})
+			entries = append(entries, batchEntry{Index: i + 1, Label: text, Start: start, End: end, Note: err.Error()})
 			fail++
 			continue
 		}
 
 		end := time.Now()
 		fmt.Printf("  → %s (%d bytes)\n", outPath, len(audio))
-		entries = append(entries, batchEntry{i + 1, text, start, end, true, outPath})
+		entries = append(entries, batchEntry{Index: i + 1, Label: text, Start: start, End: end, OK: true, Note: outPath})
 		ok++
 	}
 
@@ -377,12 +411,14 @@ func runTTSBatch() {
 // ---- Batch timing log ---------------------------------------------------
 
 type batchEntry struct {
-	Index int
-	Label string    // filename (STT) or text snippet (TTS)
-	Start time.Time
-	End   time.Time
-	OK    bool
-	Note  string // output path on success, error message on failure
+	Index    int
+	Label    string    // filename (STT) or text snippet (TTS)
+	Start    time.Time
+	End      time.Time
+	OK       bool
+	Note     string // output path on success, error message on failure
+	Retries  int    // retries used beyond first attempt
+	ErrCodes []int  // server error codes seen during session (e.g. -11)
 }
 
 func writeBatchLog(path string, batchStart time.Time, entries []batchEntry) {
@@ -394,10 +430,22 @@ func writeBatchLog(path string, batchStart time.Time, entries []batchEntry) {
 	defer f.Close()
 
 	total := len(entries)
-	ok := 0
+	ok, fail, retried := 0, 0, 0
+	errReasons := map[string]int{}
+	serverErrCodes := map[int]int{} // code → count across all entries
 	for _, e := range entries {
 		if e.OK {
 			ok++
+		} else {
+			fail++
+			reason := classifyErr(e.Note)
+			errReasons[reason]++
+		}
+		if e.Retries > 0 {
+			retried++
+		}
+		for _, code := range e.ErrCodes {
+			serverErrCodes[code]++
 		}
 	}
 	batchEnd := time.Now()
@@ -405,7 +453,24 @@ func writeBatchLog(path string, batchStart time.Time, entries []batchEntry) {
 	fmt.Fprintf(f, "Batch run:  %s\n", batchStart.Format("2006-01-02 15:04:05"))
 	fmt.Fprintf(f, "Completed:  %s\n", batchEnd.Format("2006-01-02 15:04:05"))
 	fmt.Fprintf(f, "Duration:   %s\n", batchEnd.Sub(batchStart).Round(time.Millisecond))
-	fmt.Fprintf(f, "Total:      %d items, %d ok, %d failed\n\n", total, ok, total-ok)
+	fmt.Fprintf(f, "Total:      %d items, %d ok, %d failed\n", total, ok, fail)
+	fmt.Fprintf(f, "Retried:    %d files needed at least one retry\n", retried)
+
+	if len(errReasons) > 0 {
+		fmt.Fprintf(f, "\nFailure breakdown:\n")
+		for reason, count := range errReasons {
+			fmt.Fprintf(f, "  %-40s %d\n", reason, count)
+		}
+	}
+
+	if len(serverErrCodes) > 0 {
+		fmt.Fprintf(f, "\nServer error codes (across all attempts):\n")
+		for code, count := range serverErrCodes {
+			fmt.Fprintf(f, "  code=%-6d %d occurrences\n", code, count)
+		}
+	}
+
+	fmt.Fprintf(f, "\n")
 
 	for _, e := range entries {
 		dur := e.End.Sub(e.Start).Round(time.Millisecond)
@@ -417,7 +482,26 @@ func writeBatchLog(path string, batchStart time.Time, entries []batchEntry) {
 		fmt.Fprintf(f, "     start:    %s\n", e.Start.Format("15:04:05.000"))
 		fmt.Fprintf(f, "     end:      %s\n", e.End.Format("15:04:05.000"))
 		fmt.Fprintf(f, "     duration: %s\n", dur)
+		fmt.Fprintf(f, "     retries:  %d\n", e.Retries)
+		if len(e.ErrCodes) > 0 {
+			fmt.Fprintf(f, "     errcodes: %v\n", e.ErrCodes)
+		}
 		fmt.Fprintf(f, "     status:   %s  %s\n\n", status, e.Note)
+	}
+}
+
+func classifyErr(note string) string {
+	switch {
+	case strings.Contains(note, "no transcript"):
+		return "no transcript (empty/timeout)"
+	case strings.Contains(note, "ws connect"):
+		return "gateway unreachable"
+	case strings.Contains(note, "send audio"):
+		return "connection dropped mid-stream"
+	case strings.Contains(note, "read welcome"):
+		return "gateway handshake failed"
+	default:
+		return "other: " + note
 	}
 }
 
