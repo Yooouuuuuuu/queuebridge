@@ -1,26 +1,10 @@
 # TODO
 
-Items are ordered by priority. Config and shutdown unblock everything else; session
-management is the core product feature; observability and gRPC follow from there.
+Items are ordered by priority. Session management is the core product feature; observability and gRPC follow from there.
 
 ---
 
-## 1 · Config file
-
-- [x] Pool definitions from a config file (YAML or TOML): name, service, protocol, endpoint, connections
-- [x] Load from env or config file; CLI flags remain as overrides
-
----
-
-## 2 · Graceful shutdown
-
-- [x] Stop accepting new jobs on SIGTERM / SIGINT
-- [x] Drain the queue: wait for all in-flight jobs to finish before exiting
-- [x] Signal in-progress workers to complete (not abort) their current job
-
----
-
-## 3 · Inbound session management
+## 1 · Inbound session management
 
 - [ ] Client sends type tag on connect (e.g. `type: customer_service`)
 - [ ] Gateway checks type tag to decide connection lifetime:
@@ -33,29 +17,38 @@ management is the core product feature; observability and gRPC follow from there
 
 ---
 
-## 4 · Observability
+## 2 · Observability
 
 - [ ] Per-pool metrics: active, idle, queue depth, throughput, error rate
 - [ ] `/metrics` endpoint (Prometheus format)
 
 ---
 
-## 5 · gRPC inbound gateway
+## 3 · gRPC inbound gateway
 
 - [ ] Accept jobs over gRPC in addition to HTTP/WS
 - [ ] Job metadata (priority, target pool) in request headers or message fields
 
 ---
 
-## 6 · Minor / polish
+## 4 · Minor / polish
 
 - [ ] Optional per-job timeout: job cancelled if not picked up within N seconds
 - [ ] High-priority jobs with explicit pool tag bypassing normal queue ordering (not yet tested under load)
+- [ ] Pool routing tags: `strict` (no fallback — return 503 if named pool is missing or
+      congested) and `priority-privilege` (skip congestion check, always use the named
+      pool even when busy). Currently all requests use warn+fallback by default.
 - [ ] Docker support
 
 ---
 
 ## Done
+
+### Config & operations
+- [x] YAML config file (`--config`): pools, listen address, STT/TTS settings
+- [x] Per-pool endpoint override; tokens and endpoints removed from source defaults
+- [x] Graceful shutdown: drain flag, `sync.WaitGroup` per worker, 30s timeout
+- [x] Two-phase context split: signal stops gateway; broker workers finish in-flight jobs
 
 ### Broker
 - [x] Generic `Job` struct: `Service`, `Pool`, `Priority`, `Payload`, `ResultCh`
@@ -72,7 +65,13 @@ management is the core product feature; observability and gRPC follow from there
 - [x] `ListeningCh()` on STT client: channel closed when server sends `{"state":"listening"}` — eliminates the start/stop race that caused silent session rejections
 - [x] `ListeningCh` captured right after `StartRecognition` so the server's reset window overlaps with the current job's audio processing — wait is near-instant on a busy queue
 
-### Gateway
+### Gateway & API
 - [x] WS inbound protocol: `start` → `ready` (backpressure) → audio chunks → `stop` → results → `done`
 - [x] `done` message sent when `ResultCh` closes — client exits immediately, no read-deadline dead time
 - [x] HTTP POST inbound for TTS
+- [x] Versioned API under `/v1/`: `POST /v1/tts`, `POST /v1/stt`, `WS /v1/stt/stream`
+- [x] HTTP STT: multipart WAV upload → JSON transcript
+- [x] Per-request TTS voice overrides (speaker, language, speed, gain, out_format)
+- [x] Smart pool routing: warn + fallback to least-loaded when named pool is missing or congested
+- [x] Consistent JSON error format with string error codes across all endpoints
+- [x] Catch-all `/v1/<unknown>` returns proper JSON error for unconfigured services

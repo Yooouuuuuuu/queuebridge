@@ -99,14 +99,14 @@ type wsMsg struct {
 	Type  string `json:"type"`
 	Text  string `json:"text,omitempty"`
 	Final bool   `json:"final,omitempty"`
-	Code  int    `json:"code,omitempty"`
+	Code  string `json:"code,omitempty"`
 	Msg   string `json:"msg,omitempty"`
 }
 
 // sttResult holds transcript and any server error codes seen during the session.
 type sttResult struct {
 	transcript string
-	errCodes   []int // non-zero error codes received from server (e.g. -11)
+	errCodes   []string // error codes received from server
 }
 
 func runSTT(wavPath string) (sttResult, error) {
@@ -124,7 +124,7 @@ func runSTT(wavPath string) (sttResult, error) {
 			hdr.SampleRate, hdr.Channels, hdr.BitsPerSample)
 	}
 
-	conn, _, err := websocket.DefaultDialer.Dial("ws://"+gatewayAddr+"/ws", nil)
+	conn, _, err := websocket.DefaultDialer.Dial("ws://"+gatewayAddr+"/v1/stt/stream", nil)
 	if err != nil {
 		return sttResult{}, fmt.Errorf("ws connect: %w", err)
 	}
@@ -183,11 +183,11 @@ func runSTT(wavPath string) (sttResult, error) {
 				conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			}
 		case "error":
-			fmt.Printf("  [error] code=%d %s\n", m.Code, m.Msg)
-			if m.Code != 0 {
+			fmt.Printf("  [error] code=%s %s\n", m.Code, m.Msg)
+			if m.Code != "" {
 				res.errCodes = append(res.errCodes, m.Code)
 				// Fatal broker/session error — no transcript is coming; fail fast.
-				return res, fmt.Errorf("session error %d: %s", m.Code, m.Msg)
+				return res, fmt.Errorf("session error %s: %s", m.Code, m.Msg)
 			}
 		case "done":
 			// Broker signals the job is fully complete; no need to wait for deadline.
@@ -305,7 +305,7 @@ func runSTTBatch(workers int) {
 
 func runTTS(text string) {
 	body, _ := json.Marshal(map[string]string{"text": text})
-	resp, err := http.Post("http://"+gatewayAddr+"/tts", "application/json", bytes.NewReader(body))
+	resp, err := http.Post("http://"+gatewayAddr+"/v1/tts", "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Fatalf("tts request: %v", err)
 	}
@@ -373,7 +373,7 @@ func runTTSBatch(workers int) {
 			start := time.Now()
 
 			body, _ := json.Marshal(map[string]string{"text": text})
-			resp, err := http.Post("http://"+gatewayAddr+"/tts", "application/json", bytes.NewReader(body))
+			resp, err := http.Post("http://"+gatewayAddr+"/v1/tts", "application/json", bytes.NewReader(body))
 			if err != nil {
 				end := time.Now()
 				fmt.Printf("[%d/%d] ERROR: %v\n", i+1, len(lines), err)
@@ -437,7 +437,7 @@ type batchEntry struct {
 	OK       bool
 	Note     string // output path on success, error message on failure
 	Retries  int    // retries used beyond first attempt
-	ErrCodes []int  // server error codes seen during session (e.g. -11)
+	ErrCodes []string // server error codes seen during session
 }
 
 func writeBatchLog(path string, batchStart time.Time, entries []batchEntry) {
@@ -451,7 +451,7 @@ func writeBatchLog(path string, batchStart time.Time, entries []batchEntry) {
 	total := len(entries)
 	ok, fail, retried := 0, 0, 0
 	errReasons := map[string]int{}
-	serverErrCodes := map[int]int{} // code → count across all entries
+	serverErrCodes := map[string]int{} // code → count across all entries
 	for _, e := range entries {
 		if e.OK {
 			ok++
@@ -485,7 +485,7 @@ func writeBatchLog(path string, batchStart time.Time, entries []batchEntry) {
 	if len(serverErrCodes) > 0 {
 		fmt.Fprintf(f, "\nServer error codes (across all attempts):\n")
 		for code, count := range serverErrCodes {
-			fmt.Fprintf(f, "  code=%-6d %d occurrences\n", code, count)
+			fmt.Fprintf(f, "  code=%-30s %d occurrences\n", code, count)
 		}
 	}
 

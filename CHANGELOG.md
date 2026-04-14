@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.6.0] — 2026-04-14 — External API v1
+
+### Added
+- **`POST /v1/tts`**: JSON request with optional per-request voice overrides (`speaker`,
+  `language`, `speed`, `gain`, `out_format`); returns raw `audio/wav`. Response headers
+  `X-Pool-Used` and `X-Warning` carry routing metadata.
+- **`POST /v1/stt`**: multipart WAV file upload → JSON transcript (`transcript`,
+  `pool_used`, `warning`). Synchronous; suitable for pre-recorded files.
+- **`WS /v1/stt/stream`**: enhanced streaming STT — `start` message now accepts `pool`
+  and `priority` fields; server sends `warning` frame if pool fallback occurs; error
+  `code` field changed from int to string.
+- **`GET /v1/<unknown>`** catch-all: returns `{"code":"service_unavailable"}` for any
+  unconfigured service path instead of a 404 HTML page.
+- **Smart pool routing**: if a named pool is missing or congested (all workers active +
+  queue depth > 0), broker warns and routes to the least-loaded pool of the same service.
+  Callers are informed via `X-Warning` header (HTTP) or `warning` frame (WS).
+- **`broker.SubmitResult`**: `Submit` now returns `(SubmitResult, error)` with `Pool`
+  and `Warning` fields. Sentinel errors `ErrServiceNotConfigured` and `ErrDraining` allow
+  the gateway to classify errors without string matching.
+- **`TTSPayload` override fields**: `Speaker`, `Language`, `OutFormat`, `Speed`, `Gain`,
+  `PhraseBreak` — zero value means use pool config default.
+- Legacy routes `/tts` and `/ws` kept as aliases for backward compatibility.
+
+### Changed
+- `broker.Submit` signature: `error` → `(SubmitResult, error)`.
+- `resolvePool` now checks service existence before pool lookup; named-pool requests for
+  unconfigured services return `ErrServiceNotConfigured` immediately.
+- `runTTSWorker` calls `cli.SynthesizeWithOptions` instead of `cli.Synthesize`.
+- Playground routes updated to `/v1/stt/stream` and `/v1/tts`; WS error `code` field
+  changed from `int` to `string` throughout.
+
+---
+
 ## [0.5.0] — 2026-04-14 — Config File & Graceful Shutdown
 
 ### Added

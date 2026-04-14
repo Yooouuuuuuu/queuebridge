@@ -5,6 +5,7 @@ package broker
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -19,6 +20,12 @@ import (
 // PoolConfig is re-exported from the config package for callers that only
 // import broker.
 type PoolConfig = config.PoolConfig
+
+// Sentinel errors for gateway-level error classification.
+var (
+	ErrServiceNotConfigured = errors.New("service not configured")
+	ErrDraining             = errors.New("server is shutting down")
+)
 
 // ---- Job types ----
 
@@ -38,8 +45,15 @@ type STTPayload struct {
 }
 
 // TTSPayload carries text for a TTS job.
+// Override fields are optional; zero value means "use the pool's config default".
 type TTSPayload struct {
-	Text string
+	Text        string
+	Speaker     string
+	Language    string
+	OutFormat   string
+	Speed       float32
+	Gain        float32
+	PhraseBreak bool
 }
 
 // Result is one message delivered back to the job submitter.
@@ -50,6 +64,12 @@ type Result struct {
 	Audio   []byte // TTS: synthesised audio bytes
 	ErrCode int    // non-zero = error
 	ErrMsg  string
+}
+
+// SubmitResult carries routing metadata returned by Submit.
+type SubmitResult struct {
+	Pool    string // actual pool name used
+	Warning string // non-empty when fallback routing occurred
 }
 
 // ---- Priority queue ----
@@ -261,7 +281,15 @@ func (b *Broker) runTTSWorker(ctx context.Context, p *pool, cli *tts.Client) {
 		}
 
 		p.active.Add(1)
-		audio, err := cli.Synthesize(ctx, payload.Text)
+		opts := tts.SynthesizeOptions{
+			Speaker:     payload.Speaker,
+			Language:    payload.Language,
+			OutFormat:   payload.OutFormat,
+			Speed:       payload.Speed,
+			Gain:        payload.Gain,
+			PhraseBreak: payload.PhraseBreak,
+		}
+		audio, err := cli.SynthesizeWithOptions(ctx, payload.Text, opts)
 		p.active.Add(-1)
 
 		if err != nil {
@@ -554,30 +582,64 @@ func (b *Broker) runArmedSession(ctx context.Context, p *pool, cli *stt.Client) 
 
 // ---- Routing ----
 
-// Submit enqueues a job. Always succeeds (blocking submit, no rejection).
-// Returns an error only if the target pool doesn't exist, no pool serves the
-// requested service, or the broker is draining.
-func (b *Broker) Submit(job Job) error {
+// Submit enqueues a job and returns routing metadata.
+// Returns ErrServiceNotConfigured if no pool handles job.Service,
+// ErrDraining if the broker is shutting down.
+func (b *Broker) Submit(job Job) (SubmitResult, error) {
 	if b.draining.Load() {
-		return fmt.Errorf("server is shutting down")
+		return SubmitResult{}, ErrDraining
 	}
-	p, err := b.resolvePool(job)
+	p, warning, err := b.resolvePool(job)
 	if err != nil {
-		return err
+		return SubmitResult{}, err
 	}
 	p.queue.push(job)
-	return nil
+	return SubmitResult{Pool: p.cfg.Name, Warning: warning}, nil
 }
 
-func (b *Broker) resolvePool(job Job) (*pool, error) {
-	if job.Pool != "" {
-		p, ok := b.pools[job.Pool]
-		if !ok {
-			return nil, fmt.Errorf("unknown pool %q", job.Pool)
-		}
-		return p, nil
+func (b *Broker) resolvePool(job Job) (*pool, string, error) {
+	// Service existence check — applies regardless of pool tag.
+	if len(b.services[job.Service]) == 0 {
+		return nil, "", fmt.Errorf("%w: %q", ErrServiceNotConfigured, job.Service)
 	}
-	return b.leastLoaded(job.Service)
+
+	if job.Pool == "" {
+		p, err := b.leastLoaded(job.Service)
+		return p, "", err
+	}
+
+	named, ok := b.pools[job.Pool]
+	if !ok {
+		// Named pool not found — warn and fallback.
+		p, err := b.leastLoaded(job.Service)
+		if err != nil {
+			return nil, "", err
+		}
+		w := fmt.Sprintf("pool %q not found, routed to %q", job.Pool, p.cfg.Name)
+		log.Printf("[broker] %s", w)
+		return p, w, nil
+	}
+
+	// Named pool found — check if congested.
+	if isCongested(named) {
+		p, err := b.leastLoaded(job.Service)
+		if err != nil {
+			return nil, "", err
+		}
+		if p.cfg.Name != named.cfg.Name {
+			w := fmt.Sprintf("pool %q congested, routed to %q", job.Pool, p.cfg.Name)
+			log.Printf("[broker] %s", w)
+			return p, w, nil
+		}
+		// leastLoaded picked the same pool — accept without warning.
+	}
+
+	return named, "", nil
+}
+
+// isCongested returns true when all workers are active and the queue has backlog.
+func isCongested(p *pool) bool {
+	return p.active.Load() >= int32(p.cfg.Conns) && p.queue.len() > 0
 }
 
 func (b *Broker) leastLoaded(service string) (*pool, error) {

@@ -70,6 +70,156 @@ client                    gateway                    broker / STT
 
 The `ready` signal is the key backpressure point: the client does not stream audio until the broker has assigned a live backend session to the job. This prevents audio from buffering during queue wait and ensures the STT session is active before the first byte arrives.
 
+## API Reference
+
+All endpoints are under `/v1/`. Calling an unconfigured service (e.g. `/v1/llm`) returns a JSON error immediately.
+
+---
+
+### POST /v1/tts — Text to Speech
+
+Returns raw WAV audio. The caller is responsible for saving it.
+
+**Request** (`application/json`):
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `text` | string | yes | Text to synthesize |
+| `pool` | string | no | Target pool name; falls back to least-loaded if missing or congested |
+| `priority` | int | no | 0–9, default 0 |
+| `speaker` | string | no | Override config default |
+| `language` | string | no | Override config default |
+| `speed` | float | no | Override config default (0 = use default) |
+| `gain` | float | no | Override config default (0 = use default) |
+| `out_format` | string | no | `wav` / `mp3` / `pcm` (override config default) |
+
+**Response**: `audio/wav` binary. Headers `X-Pool-Used` and `X-Warning` (if fallback occurred).
+
+```bash
+# Save to a specific path
+curl -X POST http://localhost:8080/v1/tts \
+  -H "Content-Type: application/json" \
+  -d '{"text":"今天天氣真好"}' \
+  -o /path/to/output.wav
+
+# Save to current directory
+curl -X POST http://localhost:8080/v1/tts \
+  -H "Content-Type: application/json" \
+  -d '{"text":"今天天氣真好"}' \
+  -o output.wav
+
+# With voice overrides
+curl -X POST http://localhost:8080/v1/tts \
+  -H "Content-Type: application/json" \
+  -d '{"text":"今天天氣真好","speaker":"Sharon","speed":1.2}' \
+  -o output.wav
+
+# Show response headers (pool used, any routing warning)
+curl -X POST http://localhost:8080/v1/tts \
+  -H "Content-Type: application/json" \
+  -d '{"text":"今天天氣真好"}' \
+  -o output.wav -D -
+```
+
+---
+
+### POST /v1/stt — Speech to Text (file upload)
+
+Accepts a complete WAV file and returns the full transcript as JSON. Use this when you have a pre-recorded file and don't need streaming results.
+
+**Request** (`multipart/form-data`):
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `audio` | file | yes | WAV audio file (16 kHz mono 16-bit recommended) |
+| `pool` | string | no | Target pool name; falls back to least-loaded if missing or congested |
+| `priority` | int | no | 0–9, default 0 |
+
+**Response** (`application/json`):
+```json
+{
+  "transcript": "很快就沒事了。",
+  "pool_used": "stt-default",
+  "warning": ""
+}
+```
+
+```bash
+curl -X POST http://localhost:8080/v1/stt \
+  -F "audio=@/path/to/audio.wav" | jq .
+
+# With pool targeting
+curl -X POST http://localhost:8080/v1/stt \
+  -F "audio=@audio.wav" \
+  -F "pool=stt-primary" | jq .
+```
+
+---
+
+### WS /v1/stt/stream — Speech to Text (streaming)
+
+Use this for real-time transcription where results should arrive as the audio is being spoken.
+
+**Message flow:**
+```
+client                         server
+  │── {"type":"start"}  ──────►│  begin job; optional "pool" and "priority" fields
+  │◄── {"type":"warning"} ─────│  if pool fallback occurred (optional)
+  │◄── {"type":"ready"}  ──────│  session assigned; start streaming audio now
+  │── [binary audio chunks] ──►│
+  │── {"type":"stop"}   ───────►│  no more audio
+  │◄── {"type":"result",...} ──│  partial results (final: false)
+  │◄── {"type":"result",...} ──│  final result (final: true)
+  │◄── {"type":"done"}  ───────│  job complete
+```
+
+**Client → server messages:**
+
+```json
+{"type": "start", "pool": "stt-primary", "priority": 0}
+{"type": "stop"}
+```
+
+**Server → client messages:**
+
+```json
+{"type": "connected"}
+{"type": "warning", "msg": "pool \"stt-primary\" not found, routed to \"stt-default\""}
+{"type": "ready"}
+{"type": "result", "text": "今天天氣", "final": false}
+{"type": "result", "text": "今天天氣真好。", "final": true}
+{"type": "error", "code": "upstream_failed", "msg": "..."}
+{"type": "done"}
+```
+
+---
+
+### GET /health
+
+```bash
+curl http://localhost:8080/health
+# ok
+```
+
+---
+
+### Error responses
+
+All errors return JSON:
+```json
+{"error": "service \"llm\" not configured", "code": "service_unavailable"}
+```
+
+| Code | Meaning |
+|---|---|
+| `service_unavailable` | No pool configured for this service |
+| `bad_request` | Invalid request format |
+| `upstream_failed` | Backend STT/TTS service returned an error |
+| `timeout` | Job did not complete within the deadline |
+| `shutting_down` | Server is draining, not accepting new jobs |
+
+---
+
 ## Current State
 
 | Service | Protocol | Connections | Status |
@@ -79,7 +229,7 @@ The `ready` signal is the key backpressure point: the client does not stream aud
 
 ## Configuration
 
-FlowDispatch is configured with a YAML file. Copy `testdata/flowdispatch.example.yaml` to e.g. `dev.yaml`, fill in your endpoints and tokens, then pass it at startup:
+FlowDispatch is configured with a YAML file. Copy `flowdispatch.example.yaml` to e.g. `dev.yaml`, fill in your endpoints and tokens, then pass it at startup:
 
 ```bash
 queuebridge serve --config dev.yaml
