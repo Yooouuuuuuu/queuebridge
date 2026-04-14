@@ -1,0 +1,87 @@
+syntax = "proto3";
+
+package flowdispatch;
+
+option go_package = "github.com/Yooouuuuuuu/flowdispatch/proto";
+
+// FlowDispatch inbound gRPC gateway.
+//
+// URL = transport only — the service field in the message drives routing,
+// matching the HTTP and WebSocket transports.
+service FlowDispatch {
+  // Submit is a unary RPC mirroring POST /v1/http.
+  // Use for request/response services (TTS, future STT file upload).
+  rpc Submit(SubmitRequest) returns (SubmitResponse);
+
+  // Stream is a bidirectional streaming RPC mirroring WS /v1/ws.
+  // Use for streaming services (STT) and session-oriented connections.
+  rpc Stream(stream StreamMessage) returns (stream StreamMessage);
+}
+
+// SubmitRequest mirrors the POST /v1/http JSON body.
+message SubmitRequest {
+  string service  = 1;
+  string pool     = 2;
+  int32  priority = 3;
+
+  // TTS fields
+  string text        = 4;
+  string speaker     = 5;
+  string language    = 6;
+  float  speed       = 7;
+  float  gain        = 8;
+  string out_format  = 9;
+  bool   phrase_break = 10;
+
+  // STT fields (future: unary file upload)
+  bytes audio = 11;
+}
+
+// SubmitResponse mirrors the POST /v1/http response.
+message SubmitResponse {
+  string pool_used  = 1;
+  string warning    = 2;
+  string error_code = 3;
+  string error_msg  = 4;
+
+  // TTS result
+  bytes audio = 5;
+
+  // STT result
+  string transcript = 6;
+}
+
+// StreamMessage is used for both directions on the Stream RPC,
+// mirroring the WS /v1/ws message protocol.
+message StreamMessage {
+  string type = 1; // "start", "stop", "ready", "result", "done", "error", "warning"
+
+  // start fields (client → server)
+  string service      = 2;
+  string session_type = 3;
+  string pool         = 4;
+  int32  priority     = 5;
+
+  // TTS start fields
+  string text         = 6;
+  string speaker      = 7;
+  string language     = 8;
+  float  speed        = 9;
+  float  gain         = 10;
+  string out_format   = 11;
+  bool   phrase_break = 12;
+
+  // Audio chunk (client → server, STT streaming)
+  bytes audio = 13;
+
+  // Result fields (server → client)
+  string result_text = 14;
+  bool   final       = 15;
+
+  // TTS audio result (server → client)
+  bytes result_audio = 16;
+
+  // Error / warning fields (server → client)
+  string code = 17;
+  string msg  = 18;
+}

@@ -1,6 +1,6 @@
 # TODO
 
-Items are ordered by priority. Session management is the core product feature; observability and gRPC follow from there.
+Items are ordered by priority.
 
 ---
 
@@ -17,17 +17,20 @@ Items are ordered by priority. Session management is the core product feature; o
 
 ---
 
-## 2 · Observability
+## 2 · gRPC inbound gateway ✓
 
-- [ ] Per-pool metrics: active, idle, queue depth, throughput, error rate
-- [ ] `/metrics` endpoint (Prometheus format)
+- [x] `proto/flowdispatch.proto`: `Submit` (unary) and `Stream` (bidirectional streaming) RPCs
+- [x] Message fields match existing payload design: `service`, `session_type`, `pool`, `priority`, plus service-specific fields
+- [x] `internal/grpcgateway` started alongside HTTP/WS in `cmd/flowdispatch/main.go`
+- [x] Session management (session_type, sticky pool affinity) — same logic as WS; gRPC keepalive replaces manual heartbeat
+- [x] `grpc_listen` field in YAML config (default `:9090`)
 
 ---
 
-## 3 · gRPC inbound gateway
+## 3 · Observability
 
-- [ ] Accept jobs over gRPC in addition to HTTP/WS
-- [ ] Job metadata (priority, target pool) in request headers or message fields
+- [ ] Per-pool metrics: active, idle, queue depth, throughput, error rate
+- [ ] `/metrics` endpoint (Prometheus format)
 
 ---
 

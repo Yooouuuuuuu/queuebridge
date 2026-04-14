@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.8.0] — 2026-04-14 — gRPC Inbound Gateway
+
+### Added
+- **`proto/flowdispatch.proto`**: inbound gRPC service with two RPCs:
+  - `Submit(SubmitRequest) returns (SubmitResponse)` — unary, mirrors `POST /v1/http`
+  - `Stream(stream StreamMessage) returns (stream StreamMessage)` — bidirectional streaming, mirrors `WS /v1/ws`
+- **`internal/grpcgateway`**: gRPC server implementation; session management (sticky pool,
+  `session_type`) mirrors WS behaviour; gRPC keepalive replaces manual ping/pong.
+- **gRPC server reflection** registered — `grpcurl list` works without proto files.
+- **`grpc_listen`** field in config (default `:9090`); gRPC server starts alongside HTTP/WS.
+- `flowdispatch.example.yaml` and `dev.yaml` updated with `grpc_listen: ":9090"`.
+- Prerequisites and gRPC test commands added to README.
+
+---
+
 ## [0.7.0] — 2026-04-14 — Unified Transport API & Session Management
 
 ### Added

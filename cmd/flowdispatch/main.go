@@ -13,6 +13,7 @@ import (
 	"github.com/Yooouuuuuuu/flowdispatch/config"
 	"github.com/Yooouuuuuuu/flowdispatch/internal/broker"
 	"github.com/Yooouuuuuuu/flowdispatch/internal/gateway"
+	"github.com/Yooouuuuuuu/flowdispatch/internal/grpcgateway"
 	"github.com/Yooouuuuuuu/flowdispatch/internal/stt"
 	"github.com/Yooouuuuuuu/flowdispatch/internal/tts"
 )
@@ -84,6 +85,16 @@ func serveGateway(cfg *config.Config) {
 	b := broker.New(*cfg, cfg.Pools)
 	if err := b.Start(brokerCtx); err != nil {
 		log.Fatalf("broker start: %v", err)
+	}
+
+	// Start gRPC gateway in background.
+	if cfg.GRPCListen != "" {
+		grpcSrv := grpcgateway.New(b)
+		go func() {
+			if err := grpcSrv.Start(brokerCtx, cfg.GRPCListen); err != nil {
+				log.Printf("[main] gRPC server error: %v", err)
+			}
+		}()
 	}
 
 	gw := gateway.New(cfg.Listen, b)

@@ -47,8 +47,8 @@ HTTP      ──┼──► route ──► queue─┤  │             │   
 **Backend connections (outbound) — always persistent.**
 Connections are established at startup and kept alive for the process lifetime. Each connection processes one job at a time; the number of connections per pool is bounded by what the backend service allows.
 
-**Client connections (inbound) — short-lived today, session-oriented planned.**
-Currently each WS connection handles one job: `start` → `ready` → audio → `stop` → results → `done`. Session-oriented types (e.g. `customer_service`) with persistent connections and pool affinity are on the roadmap.
+**Client connections (inbound) — three transports.**
+HTTP for request/response, WebSocket for streaming, gRPC for both. Session-oriented connections (persistent, pool affinity, heartbeat) are supported on WS and gRPC via the `session_type` field.
 
 ### WS job protocol
 
@@ -238,6 +238,14 @@ All errors return JSON:
 | STT (Speech-to-Text) | WebSocket | configurable | working |
 | TTS (Text-to-Speech) | gRPC | configurable | working |
 
+**Inbound transports:**
+
+| Transport | Endpoint | Use case |
+|-----------|----------|----------|
+| HTTP | `POST /v1/http` | Request/response (TTS, STT file upload) |
+| WebSocket | `WS /v1/ws` | Streaming STT, session-oriented clients |
+| gRPC | `:9090` | All of the above via `Submit` (unary) and `Stream` (bidirectional) |
+
 ## Configuration
 
 FlowDispatch is configured with a YAML file. Copy `flowdispatch.example.yaml` to e.g. `dev.yaml`, fill in your endpoints and tokens, then pass it at startup:
@@ -273,6 +281,12 @@ Environment variables are available as a convenience override for single-service
 
 Precedence: **`--addr` flag > env vars > config file > built-in defaults**
 
+## Prerequisites
+
+- **Go 1.24+** — all dependencies are managed via `go.mod`; `go run` / `go build` fetch them automatically.
+
+---
+
 ## Quick Start
 
 ```bash
@@ -286,6 +300,29 @@ go run ./cmd/playground tts "今天天氣真的很好"
 # Batch with N concurrent clients
 go run ./cmd/playground stt-batch -workers 5
 go run ./cmd/playground tts-batch -workers 5
+```
+
+**Manual gRPC testing** (requires grpcurl — see Prerequisites):
+
+```bash
+# List available services and methods
+grpcurl -plaintext localhost:9090 list
+grpcurl -plaintext localhost:9090 list flowdispatch.FlowDispatch
+
+# TTS (unary Submit)
+grpcurl -plaintext \
+  -d '{"service":"tts","text":"今天天氣真好"}' \
+  localhost:9090 flowdispatch.FlowDispatch/Submit
+
+# STT file upload (unary Submit)
+grpcurl -plaintext \
+  -d "{\"service\":\"stt\",\"audio\":\"$(base64 -w0 testdata/stt/input/example.wav)\"}" \
+  localhost:9090 flowdispatch.FlowDispatch/Submit
+
+# Streaming STT (bidirectional Stream)
+grpcurl -plaintext \
+  -d '{"type":"start","service":"stt"}' \
+  localhost:9090 flowdispatch.FlowDispatch/Stream
 ```
 
 **Manual WS testing** (requires [wscat](https://github.com/websockets/wscat): `npm install -g wscat`):

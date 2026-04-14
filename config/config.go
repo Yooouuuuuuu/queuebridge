@@ -9,10 +9,11 @@ import (
 
 // Config holds the application configuration.
 type Config struct {
-	Listen string      `yaml:"listen"`
-	STT    STTConfig   `yaml:"stt"`
-	TTS    TTSConfig   `yaml:"tts"`
-	Pools  []PoolConfig `yaml:"pools"`
+	Listen      string       `yaml:"listen"`
+	GRPCListen  string       `yaml:"grpc_listen"`
+	STT         STTConfig    `yaml:"stt"`
+	TTS         TTSConfig    `yaml:"tts"`
+	Pools       []PoolConfig `yaml:"pools"`
 }
 
 // PoolConfig describes one named pool of backend workers.
@@ -52,7 +53,8 @@ type TTSConfig struct {
 // and must be supplied via a config file or environment variables.
 func defaults() *Config {
 	return &Config{
-		Listen: ":8080",
+		Listen:     ":8080",
+		GRPCListen: ":9090",
 		STT: STTConfig{
 			UID:    "go-bridge-user",
 			Domain: "freeSTT-zh-TW",
