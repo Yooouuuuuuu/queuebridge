@@ -72,70 +72,60 @@ The `ready` signal is the key backpressure point: the client does not stream aud
 
 ## API Reference
 
-All endpoints are under `/v1/`. Calling an unconfigured service (e.g. `/v1/llm`) returns a JSON error immediately.
+Two endpoints. The URL identifies the transport; the `service` field in the payload identifies what to do.
 
 ---
 
-### POST /v1/tts — Text to Speech
+### POST /v1/http — HTTP (request/response)
 
-Returns raw WAV audio. The caller is responsible for saving it.
-
-**Request** (`application/json`):
+**TTS** (`Content-Type: application/json`):
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `service` | string | yes | `"tts"` |
 | `text` | string | yes | Text to synthesize |
-| `pool` | string | no | Target pool name; falls back to least-loaded if missing or congested |
+| `pool` | string | no | Target pool; falls back to least-loaded if missing or congested |
 | `priority` | int | no | 0–9, default 0 |
 | `speaker` | string | no | Override config default |
 | `language` | string | no | Override config default |
 | `speed` | float | no | Override config default (0 = use default) |
 | `gain` | float | no | Override config default (0 = use default) |
-| `out_format` | string | no | `wav` / `mp3` / `pcm` (override config default) |
+| `out_format` | string | no | `wav` / `mp3` / `pcm` |
 
-**Response**: `audio/wav` binary. Headers `X-Pool-Used` and `X-Warning` (if fallback occurred).
+Response: `audio/wav` binary. Headers `X-Pool-Used` and `X-Warning` (if fallback occurred).
 
 ```bash
-# Save to a specific path
-curl -X POST http://localhost:8080/v1/tts \
-  -H "Content-Type: application/json" \
-  -d '{"text":"今天天氣真好"}' \
-  -o /path/to/output.wav
-
 # Save to current directory
-curl -X POST http://localhost:8080/v1/tts \
+curl -X POST http://localhost:8080/v1/http \
   -H "Content-Type: application/json" \
-  -d '{"text":"今天天氣真好"}' \
+  -d '{"service":"tts","text":"今天天氣真好"}' \
   -o output.wav
 
 # With voice overrides
-curl -X POST http://localhost:8080/v1/tts \
+curl -X POST http://localhost:8080/v1/http \
   -H "Content-Type: application/json" \
-  -d '{"text":"今天天氣真好","speaker":"Sharon","speed":1.2}' \
+  -d '{"service":"tts","text":"今天天氣真好","speaker":"Sharon","speed":1.2}' \
   -o output.wav
 
-# Show response headers (pool used, any routing warning)
-curl -X POST http://localhost:8080/v1/tts \
+# Show response headers
+curl -X POST http://localhost:8080/v1/http \
   -H "Content-Type: application/json" \
-  -d '{"text":"今天天氣真好"}' \
+  -d '{"service":"tts","text":"今天天氣真好"}' \
   -o output.wav -D -
 ```
 
 ---
 
-### POST /v1/stt — Speech to Text (file upload)
-
-Accepts a complete WAV file and returns the full transcript as JSON. Use this when you have a pre-recorded file and don't need streaming results.
-
-**Request** (`multipart/form-data`):
+**STT** (`Content-Type: multipart/form-data`):
 
 | Field | Type | Required | Description |
 |---|---|---|---|
+| `service` | string | yes | `"stt"` |
 | `audio` | file | yes | WAV audio file (16 kHz mono 16-bit recommended) |
-| `pool` | string | no | Target pool name; falls back to least-loaded if missing or congested |
+| `pool` | string | no | Target pool; falls back to least-loaded if missing or congested |
 | `priority` | int | no | 0–9, default 0 |
 
-**Response** (`application/json`):
+Response (`application/json`):
 ```json
 {
   "transcript": "很快就沒事了。",
@@ -145,40 +135,56 @@ Accepts a complete WAV file and returns the full transcript as JSON. Use this wh
 ```
 
 ```bash
-curl -X POST http://localhost:8080/v1/stt \
+curl -X POST http://localhost:8080/v1/http \
+  -F "service=stt" \
   -F "audio=@/path/to/audio.wav" | jq .
 
 # With pool targeting
-curl -X POST http://localhost:8080/v1/stt \
+curl -X POST http://localhost:8080/v1/http \
+  -F "service=stt" \
   -F "audio=@audio.wav" \
   -F "pool=stt-primary" | jq .
 ```
 
 ---
 
-### WS /v1/stt/stream — Speech to Text (streaming)
+### WS /v1/ws — WebSocket (streaming)
 
-Use this for real-time transcription where results should arrive as the audio is being spoken.
+All fields go in the `start` message. The URL is transport-only.
 
-**Message flow:**
+**STT message flow:**
 ```
 client                         server
-  │── {"type":"start"}  ──────►│  begin job; optional "pool" and "priority" fields
-  │◄── {"type":"warning"} ─────│  if pool fallback occurred (optional)
-  │◄── {"type":"ready"}  ──────│  session assigned; start streaming audio now
-  │── [binary audio chunks] ──►│
-  │── {"type":"stop"}   ───────►│  no more audio
-  │◄── {"type":"result",...} ──│  partial results (final: false)
-  │◄── {"type":"result",...} ──│  final result (final: true)
-  │◄── {"type":"done"}  ───────│  job complete
+  │── {"type":"start","service":"stt",...} ►│
+  │◄── {"type":"warning"} ─────────────────│  if pool fallback (optional)
+  │◄── {"type":"ready"}  ──────────────────│  session assigned; stream audio now
+  │── [binary audio chunks] ──────────────►│
+  │── {"type":"stop"}   ───────────────────►│
+  │◄── {"type":"result", "text":"...", "final":false} ─│  partial
+  │◄── {"type":"result", "text":"...", "final":true}  ─│  final
+  │◄── {"type":"done"}  ───────────────────│  job complete
+```
+
+**TTS message flow:**
+```
+client                         server
+  │── {"type":"start","service":"tts","text":"..."} ►│
+  │◄── {"type":"warning"} ─────────────────│  if pool fallback (optional)
+  │◄── [binary audio data] ────────────────│
+  │◄── {"type":"done"}  ───────────────────│
 ```
 
 **Client → server messages:**
 
-```json
-{"type": "start", "pool": "stt-primary", "priority": 0}
-{"type": "stop"}
-```
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | yes | `"start"` or `"stop"` |
+| `service` | string | yes | `"stt"` or `"tts"` |
+| `session_type` | string | no | Non-empty → persistent session (heartbeat + pool affinity) |
+| `pool` | string | no | Target pool |
+| `priority` | int | no | 0–9, default 0 |
+| `text` | string | TTS only | Text to synthesize |
+| `speaker`, `language`, `speed`, `gain`, `out_format` | — | TTS only | Voice overrides |
 
 **Server → client messages:**
 
@@ -191,6 +197,11 @@ client                         server
 {"type": "error", "code": "upstream_failed", "msg": "..."}
 {"type": "done"}
 ```
+
+**Session behaviour:**
+
+- `session_type` empty (default): server closes the connection after the first `done`.
+- `session_type` non-empty (e.g. `"customer_service"`): connection stays open after `done`. The first job's pool becomes the sticky pool for all subsequent jobs on that connection (soft affinity — falls back to least-loaded if the sticky pool is congested). Server sends WebSocket pings every 30 s; unresponsive connections are cleaned up.
 
 ---
 
@@ -212,7 +223,7 @@ All errors return JSON:
 
 | Code | Meaning |
 |---|---|
-| `service_unavailable` | No pool configured for this service |
+| `service_unavailable` | Service not configured |
 | `bad_request` | Invalid request format |
 | `upstream_failed` | Backend STT/TTS service returned an error |
 | `timeout` | Job did not complete within the deadline |
@@ -268,13 +279,34 @@ Precedence: **`--addr` flag > env vars > config file > built-in defaults**
 # Normal usage
 go run ./cmd/flowdispatch serve --config dev.yaml
 
-# Single requests (uses env vars or built-in defaults for connection)
+# Single requests
 go run ./cmd/playground stt testdata/stt/input/example.wav
 go run ./cmd/playground tts "今天天氣真的很好"
 
 # Batch with N concurrent clients
-go run ./cmd/playground stt-batch -workers 20
-go run ./cmd/playground tts-batch
+go run ./cmd/playground stt-batch -workers 5
+go run ./cmd/playground tts-batch -workers 5
+```
+
+**Manual WS testing** (requires [wscat](https://github.com/websockets/wscat): `npm install -g wscat`):
+
+```bash
+# Short-lived STT session (server closes after done)
+wscat -c ws://localhost:8080/v1/ws
+> {"type":"start","service":"stt"}
+# stream audio separately, then:
+> {"type":"stop"}
+
+# Session-oriented (connection stays open after done, pool affinity applied)
+wscat -c ws://localhost:8080/v1/ws
+> {"type":"start","service":"stt","session_type":"customer_service"}
+# after done, send another job on the same connection:
+> {"type":"start","service":"stt","session_type":"customer_service"}
+
+# TTS over WS
+wscat -c ws://localhost:8080/v1/ws
+> {"type":"start","service":"tts","text":"今天天氣真好"}
+# server sends binary audio then done
 ```
 
 ## Project Structure
@@ -282,7 +314,7 @@ go run ./cmd/playground tts-batch
 ```
 flowdispatch/
 ├── cmd/
-│   ├── flowdispatch/main.go   # serve subcommand; --pool / --stt / --tts flags
+│   ├── flowdispatch/main.go   # serve subcommand
 │   ├── playground/main.go    # test CLI: stt, stt-batch, tts, tts-batch
 │   └── sttdebug/main.go      # direct STT backend debug tool (bypasses broker)
 ├── internal/

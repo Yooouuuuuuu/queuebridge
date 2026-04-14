@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.7.0] — 2026-04-14 — Unified Transport API & Session Management
+
+### Added
+- **`WS /v1/ws`**: unified WebSocket endpoint replacing `/v1/stt/stream`. All routing
+  info (`service`, `session_type`, `pool`, `priority`) goes in the `start` message;
+  the URL is transport-only.
+- **Inbound session management**: `start` message accepts `session_type`
+  (e.g. `"customer_service"`). Non-empty → session-oriented connection: persists after
+  `done`, pool affinity, 30 s heartbeat ping/pong. Empty → short-lived: server sends
+  WS close after `done`.
+- **Pool affinity (soft)**: first job's pool becomes the sticky pool for subsequent
+  jobs on the same session. Falls back to least-loaded with warning if sticky pool
+  is congested.
+- **Session registry** in gateway: `session_id → { client_type, sticky_pool, last_seen }`.
+  Cleaned up on disconnect or heartbeat failure.
+- **`POST /v1/http`**: unified HTTP endpoint replacing `/v1/tts` and `/v1/stt`. Service
+  is declared via `"service"` field in the JSON body (TTS) or form field (STT).
+- **TTS over WS**: `start` with `service: "tts"` and `text` field; server returns binary
+  audio then `done`.
+
+### Changed
+- `cmd/queuebridge` renamed to `cmd/flowdispatch`; binary and all README references updated.
+- Old routes (`/v1/tts`, `/v1/stt`, `/v1/stt/stream`, `/tts`, `/ws`) removed entirely.
+
+---
+
 ## [0.6.0] — 2026-04-14 — External API v1
 
 ### Added

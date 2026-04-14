@@ -9,7 +9,9 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Yooouuuuuuu/flowdispatch/internal/broker"
@@ -49,6 +51,40 @@ func classifySubmitError(err error) (status int, code string) {
 	}
 }
 
+// ---- Session registry ----
+
+type session struct {
+	id         string
+	clientType string
+	stickyPool string
+	lastSeen   time.Time
+}
+
+type sessionRegistry struct {
+	mu       sync.RWMutex
+	sessions map[string]*session
+}
+
+func (r *sessionRegistry) create(clientType string) *session {
+	s := &session{
+		id:         fmt.Sprintf("%x", time.Now().UnixNano()),
+		clientType: clientType,
+		lastSeen:   time.Now(),
+	}
+	r.mu.Lock()
+	r.sessions[s.id] = s
+	r.mu.Unlock()
+	log.Printf("[gateway/session] created id=%s type=%s", s.id, s.clientType)
+	return s
+}
+
+func (r *sessionRegistry) remove(id string) {
+	r.mu.Lock()
+	delete(r.sessions, id)
+	r.mu.Unlock()
+	log.Printf("[gateway/session] removed id=%s", id)
+}
+
 // ---- Gateway ----
 
 var upgrader = websocket.Upgrader{
@@ -57,31 +93,27 @@ var upgrader = websocket.Upgrader{
 
 // Gateway handles inbound HTTP and WebSocket connections.
 type Gateway struct {
-	addr   string
-	broker *broker.Broker
-	server *http.Server
+	addr     string
+	broker   *broker.Broker
+	server   *http.Server
+	sessions sessionRegistry
 }
 
 // New creates a Gateway listening on addr (e.g. ":8080").
 func New(addr string, b *broker.Broker) *Gateway {
-	return &Gateway{addr: addr, broker: b}
+	return &Gateway{
+		addr:     addr,
+		broker:   b,
+		sessions: sessionRegistry{sessions: make(map[string]*session)},
+	}
 }
 
 // Start registers handlers and starts the HTTP server. Blocks until ctx is cancelled.
 func (g *Gateway) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 
-	// v1 API routes.
-	mux.HandleFunc("/v1/tts", g.handleV1TTS)
-	mux.HandleFunc("/v1/stt", g.handleV1STT)
-	mux.HandleFunc("/v1/stt/stream", g.handleV1STTStream)
-	// Catch-all for unknown /v1/* services — more specific patterns above take priority.
-	mux.HandleFunc("/v1/", g.handleUnknownService)
-
-	// Legacy aliases — kept for backward compatibility.
-	mux.HandleFunc("/tts", g.handleV1TTS)
-	mux.HandleFunc("/ws", g.handleV1STTStream)
-
+	mux.HandleFunc("/v1/http", g.handleHTTP)
+	mux.HandleFunc("/v1/ws", g.handleWS)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")
@@ -95,7 +127,7 @@ func (g *Gateway) Start(ctx context.Context) error {
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("[gateway] listening on %s", g.addr)
-		log.Printf("[gateway] routes: POST /v1/tts  POST /v1/stt  WS /v1/stt/stream  GET /health")
+		log.Printf("[gateway] routes: POST /v1/http  WS /v1/ws  GET /health")
 		if err := g.server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			errCh <- err
 		}
@@ -111,12 +143,13 @@ func (g *Gateway) Start(ctx context.Context) error {
 	}
 }
 
-// ---- POST /v1/tts ----
+// ---- POST /v1/http ----
 
-type v1TTSRequest struct {
-	Text        string  `json:"text"`
+type httpJSONRequest struct {
+	Service     string  `json:"service"`
 	Pool        string  `json:"pool"`
 	Priority    int     `json:"priority"`
+	Text        string  `json:"text"`
 	Speaker     string  `json:"speaker"`
 	Language    string  `json:"language"`
 	Speed       float32 `json:"speed"`
@@ -125,17 +158,54 @@ type v1TTSRequest struct {
 	PhraseBreak bool    `json:"phrase_break"`
 }
 
-func (g *Gateway) handleV1TTS(w http.ResponseWriter, r *http.Request) {
+type httpSTTResponse struct {
+	Transcript string `json:"transcript"`
+	PoolUsed   string `json:"pool_used"`
+	Warning    string `json:"warning,omitempty"`
+}
+
+func (g *Gateway) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, errCodeBadRequest, "method not allowed")
 		return
 	}
 
-	var req v1TTSRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, errCodeBadRequest, "invalid JSON: "+err.Error())
-		return
+	ct := r.Header.Get("Content-Type")
+	switch {
+	case strings.HasPrefix(ct, "application/json"):
+		var req httpJSONRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeError(w, http.StatusBadRequest, errCodeBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		switch req.Service {
+		case "tts":
+			g.handleHTTPTTS(w, r, req)
+		default:
+			writeError(w, http.StatusServiceUnavailable, errCodeServiceUnavailable,
+				fmt.Sprintf("service %q not configured", req.Service))
+		}
+
+	case strings.HasPrefix(ct, "multipart/form-data"):
+		if err := r.ParseMultipartForm(32 << 20); err != nil {
+			writeError(w, http.StatusBadRequest, errCodeBadRequest, "invalid multipart form: "+err.Error())
+			return
+		}
+		switch r.FormValue("service") {
+		case "stt":
+			g.handleHTTPSTT(w, r)
+		default:
+			writeError(w, http.StatusServiceUnavailable, errCodeServiceUnavailable,
+				fmt.Sprintf("service %q not configured", r.FormValue("service")))
+		}
+
+	default:
+		writeError(w, http.StatusBadRequest, errCodeBadRequest,
+			"Content-Type must be application/json or multipart/form-data")
 	}
+}
+
+func (g *Gateway) handleHTTPTTS(w http.ResponseWriter, r *http.Request, req httpJSONRequest) {
 	if req.Text == "" {
 		writeError(w, http.StatusBadRequest, errCodeBadRequest, "text is required")
 		return
@@ -163,8 +233,7 @@ func (g *Gateway) handleV1TTS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[gateway/tts] synthesizing pool=%s%s: %q",
-		sr.Pool, warningLabel(sr.Warning), req.Text)
+	log.Printf("[gateway/http/tts] pool=%s%s: %q", sr.Pool, warningLabel(sr.Warning), req.Text)
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
@@ -190,25 +259,7 @@ func (g *Gateway) handleV1TTS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ---- POST /v1/stt ----
-
-type v1STTResponse struct {
-	Transcript string `json:"transcript"`
-	PoolUsed   string `json:"pool_used"`
-	Warning    string `json:"warning,omitempty"`
-}
-
-func (g *Gateway) handleV1STT(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, errCodeBadRequest, "method not allowed")
-		return
-	}
-
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		writeError(w, http.StatusBadRequest, errCodeBadRequest, "invalid multipart form: "+err.Error())
-		return
-	}
-
+func (g *Gateway) handleHTTPSTT(w http.ResponseWriter, r *http.Request) {
 	audioFile, _, err := r.FormFile("audio")
 	if err != nil {
 		writeError(w, http.StatusBadRequest, errCodeBadRequest, "audio field is required")
@@ -243,13 +294,12 @@ func (g *Gateway) handleV1STT(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[gateway/stt] job queued pool=%s%s (%d bytes)",
-		sr.Pool, warningLabel(sr.Warning), len(buf))
+	log.Printf("[gateway/http/stt] pool=%s%s (%d bytes)", sr.Pool, warningLabel(sr.Warning), len(buf))
 
 	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
 	defer cancel()
 
-	// Feed audio chunks only after the session picks up the job.
+	// Feed audio after the session picks up the job (backpressure).
 	go func() {
 		select {
 		case <-readyCh:
@@ -278,9 +328,8 @@ func (g *Gateway) handleV1STT(w http.ResponseWriter, r *http.Request) {
 		select {
 		case res, ok := <-resultCh:
 			if !ok {
-				// Job complete.
 				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(v1STTResponse{
+				json.NewEncoder(w).Encode(httpSTTResponse{
 					Transcript: transcript,
 					PoolUsed:   sr.Pool,
 					Warning:    sr.Warning,
@@ -301,12 +350,22 @@ func (g *Gateway) handleV1STT(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ---- WS /v1/stt/stream ----
+// ---- WS /v1/ws ----
 
 type wsIncoming struct {
-	Type     string `json:"type"`
-	Pool     string `json:"pool"`
-	Priority int    `json:"priority"`
+	Type        string  `json:"type"`
+	Service     string  `json:"service"`
+	SessionType string  `json:"session_type"`
+	Pool        string  `json:"pool"`
+	Priority    int     `json:"priority"`
+	// TTS-specific (used when service == "tts")
+	Text        string  `json:"text,omitempty"`
+	Speaker     string  `json:"speaker,omitempty"`
+	Language    string  `json:"language,omitempty"`
+	Speed       float32 `json:"speed,omitempty"`
+	Gain        float32 `json:"gain,omitempty"`
+	OutFormat   string  `json:"out_format,omitempty"`
+	PhraseBreak bool    `json:"phrase_break,omitempty"`
 }
 
 type wsOutgoing struct {
@@ -317,7 +376,7 @@ type wsOutgoing struct {
 	Msg   string `json:"msg,omitempty"`
 }
 
-func (g *Gateway) handleV1STTStream(w http.ResponseWriter, r *http.Request) {
+func (g *Gateway) handleWS(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Printf("[gateway/ws] upgrade error: %v", err)
@@ -326,7 +385,7 @@ func (g *Gateway) handleV1STTStream(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close()
 
 	remoteAddr := r.RemoteAddr
-	log.Printf("[gateway/ws] client connected: %s", remoteAddr)
+	log.Printf("[gateway/ws] connected: %s", remoteAddr)
 
 	var wmu sync.Mutex
 	writeJSON := func(v any) {
@@ -335,35 +394,45 @@ func (g *Gateway) handleV1STTStream(w http.ResponseWriter, r *http.Request) {
 		conn.WriteJSON(v)
 	}
 
-	writeJSON(wsOutgoing{Type: "connected"})
-
 	connCtx, connCancel := context.WithCancel(r.Context())
 	defer connCancel()
 
 	var (
-		audioCh   chan []byte
-		resultCh  chan broker.Result
-		audioOnce sync.Once
-		jobActive bool
+		jobActive  atomic.Bool
+		curAudioCh chan []byte
+		closeAudio func()
+		sess       *session
 	)
 
-	closeAudio := func() {
-		audioOnce.Do(func() {
-			if audioCh != nil {
-				close(audioCh)
-			}
-		})
-	}
-	defer closeAudio()
+	// Ensure in-flight audioCh is closed if the handler exits while a job is active.
+	defer func() {
+		if closeAudio != nil {
+			closeAudio()
+		}
+	}()
+
+	writeJSON(wsOutgoing{Type: "connected"})
 
 	for {
 		msgType, raw, err := conn.ReadMessage()
 		if err != nil {
-			log.Printf("[gateway/ws] client disconnected: %s (%v)", remoteAddr, err)
+			log.Printf("[gateway/ws] disconnected: %s (%v)", remoteAddr, err)
+			if sess != nil {
+				g.sessions.remove(sess.id)
+			}
 			return
 		}
 
 		switch msgType {
+		case websocket.BinaryMessage:
+			if jobActive.Load() && curAudioCh != nil {
+				select {
+				case curAudioCh <- raw:
+				default:
+					log.Printf("[gateway/ws] audio buffer full for %s, dropping chunk", remoteAddr)
+				}
+			}
+
 		case websocket.TextMessage:
 			var msg wsIncoming
 			if err := json.Unmarshal(raw, &msg); err != nil {
@@ -373,101 +442,227 @@ func (g *Gateway) handleV1STTStream(w http.ResponseWriter, r *http.Request) {
 
 			switch msg.Type {
 			case "start":
-				if jobActive {
+				if jobActive.Load() {
 					continue
 				}
 
-				audioCh = make(chan []byte, 256)
-				resultCh = make(chan broker.Result, 32)
-				readyCh := make(chan struct{})
-
-				sr, err := g.broker.Submit(broker.Job{
-					Service:  "stt",
-					Pool:     msg.Pool,
-					Priority: msg.Priority,
-					Payload:  &broker.STTPayload{AudioCh: audioCh},
-					ResultCh: resultCh,
-					ReadyCh:  readyCh,
-				})
-				if err != nil {
-					code := errCodeSubmitFailed
-					if errors.Is(err, broker.ErrServiceNotConfigured) {
-						code = errCodeServiceUnavailable
-					} else if errors.Is(err, broker.ErrDraining) {
-						code = errCodeShuttingDown
-					}
-					writeJSON(wsOutgoing{Type: "error", Code: code, Msg: err.Error()})
-					return
+				// Create session on first job that declares a session_type.
+				if msg.SessionType != "" && sess == nil {
+					sess = g.sessions.create(msg.SessionType)
+					g.startHeartbeat(connCtx, connCancel, conn, &wmu, sess)
 				}
 
-				jobActive = true
-				log.Printf("[gateway/ws] STT job queued pool=%s%s for %s",
-					sr.Pool, warningLabel(sr.Warning), remoteAddr)
-
-				if sr.Warning != "" {
-					writeJSON(wsOutgoing{Type: "warning", Msg: sr.Warning})
+				// Soft pool affinity: use sticky pool if client didn't specify one.
+				pool := msg.Pool
+				if pool == "" && sess != nil && sess.stickyPool != "" {
+					pool = sess.stickyPool
 				}
 
-				go func() {
-					select {
-					case <-readyCh:
-						writeJSON(wsOutgoing{Type: "ready"})
-					case <-connCtx.Done():
-					}
-				}()
+				resultCh := make(chan broker.Result, 32)
+				var readyCh chan struct{}
+				isSessionOriented := sess != nil
 
-				go func() {
-					for res := range resultCh {
-						if res.ErrCode != 0 {
-							writeJSON(wsOutgoing{Type: "error", Code: errCodeUpstreamFailed, Msg: res.ErrMsg})
-						} else {
-							writeJSON(wsOutgoing{Type: "result", Text: res.Text, Final: res.IsFinal})
+				switch msg.Service {
+				case "stt":
+					audioCh := make(chan []byte, 256)
+					once := &sync.Once{}
+					curAudioCh = audioCh
+					closeAudio = func() { once.Do(func() { close(audioCh) }) }
+					readyCh = make(chan struct{})
+
+					sr, err := g.broker.Submit(broker.Job{
+						Service:  "stt",
+						Pool:     pool,
+						Priority: msg.Priority,
+						Payload:  &broker.STTPayload{AudioCh: audioCh},
+						ResultCh: resultCh,
+						ReadyCh:  readyCh,
+					})
+					if err != nil {
+						g.wsSubmitError(writeJSON, err, isSessionOriented)
+						if !isSessionOriented {
+							return
 						}
+						continue
 					}
-					writeJSON(wsOutgoing{Type: "done"})
-				}()
+
+					if sess != nil && sess.stickyPool == "" {
+						sess.stickyPool = sr.Pool
+					}
+					log.Printf("[gateway/ws] stt queued pool=%s%s for %s", sr.Pool, warningLabel(sr.Warning), remoteAddr)
+					g.wsPostSubmit(writeJSON, connCtx, conn, &wmu, sr, resultCh, readyCh, isSessionOriented, &jobActive, sess)
+
+				case "tts":
+					if msg.Text == "" {
+						writeJSON(wsOutgoing{Type: "error", Code: errCodeBadRequest, Msg: "text is required for tts"})
+						continue
+					}
+					curAudioCh = nil
+					closeAudio = func() {}
+
+					sr, err := g.broker.Submit(broker.Job{
+						Service:  "tts",
+						Pool:     pool,
+						Priority: msg.Priority,
+						Payload: &broker.TTSPayload{
+							Text:        msg.Text,
+							Speaker:     msg.Speaker,
+							Language:    msg.Language,
+							OutFormat:   msg.OutFormat,
+							Speed:       msg.Speed,
+							Gain:        msg.Gain,
+							PhraseBreak: msg.PhraseBreak,
+						},
+						ResultCh: resultCh,
+					})
+					if err != nil {
+						g.wsSubmitError(writeJSON, err, isSessionOriented)
+						if !isSessionOriented {
+							return
+						}
+						continue
+					}
+
+					if sess != nil && sess.stickyPool == "" {
+						sess.stickyPool = sr.Pool
+					}
+					log.Printf("[gateway/ws] tts queued pool=%s%s for %s", sr.Pool, warningLabel(sr.Warning), remoteAddr)
+					g.wsPostSubmit(writeJSON, connCtx, conn, &wmu, sr, resultCh, nil, isSessionOriented, &jobActive, sess)
+
+				default:
+					// Unknown service — broker will return ErrServiceNotConfigured.
+					curAudioCh = nil
+					closeAudio = func() {}
+					sr, err := g.broker.Submit(broker.Job{
+						Service:  msg.Service,
+						Pool:     pool,
+						Priority: msg.Priority,
+						ResultCh: resultCh,
+					})
+					if err != nil {
+						g.wsSubmitError(writeJSON, err, isSessionOriented)
+						if !isSessionOriented {
+							return
+						}
+						continue
+					}
+					// Should not reach here (broker always errors for unknown services),
+					// but close the channel to avoid a goroutine leak.
+					close(resultCh)
+					_ = sr
+				}
+
+				jobActive.Store(true)
 
 			case "stop":
-				if jobActive {
-					log.Printf("[gateway/ws] stop from %s", remoteAddr)
+				if jobActive.Load() && closeAudio != nil {
 					closeAudio()
 				}
 
 			default:
 				log.Printf("[gateway/ws] unknown type %q from %s", msg.Type, remoteAddr)
 			}
-
-		case websocket.BinaryMessage:
-			if jobActive {
-				select {
-				case audioCh <- raw:
-				default:
-					log.Printf("[gateway/ws] audio buffer full for %s, dropping chunk", remoteAddr)
-				}
-			}
 		}
 	}
 }
 
-// ---- Unknown service catch-all ----
+// wsSubmitError sends an error frame with the appropriate code.
+func (g *Gateway) wsSubmitError(writeJSON func(any), err error, isSessionOriented bool) {
+	code := errCodeSubmitFailed
+	if errors.Is(err, broker.ErrServiceNotConfigured) {
+		code = errCodeServiceUnavailable
+	} else if errors.Is(err, broker.ErrDraining) {
+		code = errCodeShuttingDown
+	}
+	writeJSON(wsOutgoing{Type: "error", Code: code, Msg: err.Error()})
+}
 
-func (g *Gateway) handleUnknownService(w http.ResponseWriter, r *http.Request) {
-	// Extract service name from path: /v1/<service>[/...]
-	path := r.URL.Path[len("/v1/"):]
-	service := path
-	if i := len(path); i == 0 {
-		writeError(w, http.StatusNotFound, errCodeBadRequest, "missing service in path")
-		return
+// wsPostSubmit sends warning/ready frames and starts the result goroutine.
+// readyCh is nil for services that don't use it (TTS).
+func (g *Gateway) wsPostSubmit(
+	writeJSON func(any),
+	connCtx context.Context,
+	conn *websocket.Conn,
+	wmu *sync.Mutex,
+	sr broker.SubmitResult,
+	resultCh <-chan broker.Result,
+	readyCh <-chan struct{},
+	isSessionOriented bool,
+	jobActive *atomic.Bool,
+	sess *session,
+) {
+	if sr.Warning != "" {
+		writeJSON(wsOutgoing{Type: "warning", Msg: sr.Warning})
 	}
-	// Trim any sub-path (e.g. /v1/llm/stream → "llm")
-	for i, c := range path {
-		if c == '/' {
-			service = path[:i]
-			break
+
+	if readyCh != nil {
+		go func() {
+			select {
+			case <-readyCh:
+				writeJSON(wsOutgoing{Type: "ready"})
+			case <-connCtx.Done():
+			}
+		}()
+	}
+
+	go func() {
+		for res := range resultCh {
+			if res.ErrCode != 0 {
+				writeJSON(wsOutgoing{Type: "error", Code: errCodeUpstreamFailed, Msg: res.ErrMsg})
+			} else if res.Audio != nil {
+				wmu.Lock()
+				conn.WriteMessage(websocket.BinaryMessage, res.Audio)
+				wmu.Unlock()
+			} else {
+				writeJSON(wsOutgoing{Type: "result", Text: res.Text, Final: res.IsFinal})
+			}
 		}
-	}
-	writeError(w, http.StatusServiceUnavailable, errCodeServiceUnavailable,
-		fmt.Sprintf("service %q not configured", service))
+
+		jobActive.Store(false)
+		writeJSON(wsOutgoing{Type: "done"})
+
+		if isSessionOriented {
+			if sess != nil {
+				sess.lastSeen = time.Now()
+			}
+		} else {
+			// Short-lived: send close frame and close connection.
+			wmu.Lock()
+			conn.WriteMessage(websocket.CloseMessage,
+				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			wmu.Unlock()
+			conn.Close()
+		}
+	}()
+}
+
+// startHeartbeat starts a ping loop for session-oriented connections.
+// Cancels connCtx if a ping fails.
+func (g *Gateway) startHeartbeat(ctx context.Context, cancel context.CancelFunc, conn *websocket.Conn, wmu *sync.Mutex, sess *session) {
+	conn.SetPongHandler(func(string) error {
+		sess.lastSeen = time.Now()
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				wmu.Lock()
+				err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second))
+				wmu.Unlock()
+				if err != nil {
+					log.Printf("[gateway/ws] heartbeat failed for session %s: %v", sess.id, err)
+					cancel()
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 }
 
 // warningLabel formats a warning for log lines; returns empty string when no warning.

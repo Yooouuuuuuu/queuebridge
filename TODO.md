@@ -4,16 +4,16 @@ Items are ordered by priority. Session management is the core product feature; o
 
 ---
 
-## 1 · Inbound session management
+## 1 · Inbound session management ✓
 
-- [ ] Client sends type tag on connect (e.g. `type: customer_service`)
-- [ ] Gateway checks type tag to decide connection lifetime:
-  - session-oriented types → persistent connection, heartbeat liveness
-  - other types → short-lived, close after job completes (current behaviour)
-- [ ] Session registry in gateway: `session_id → { pool_id, last_seen, metadata }`
-- [ ] Session affinity: first job picks a pool; all subsequent jobs on the same connection go to the same pool
-- [ ] Heartbeat: ping/pong to detect dead connections; no idle timeout
-- [ ] Session cleanup on disconnect or heartbeat failure
+- [x] Client sends `session_type` in `start` message (e.g. `"session_type":"customer_service"`)
+- [x] Gateway checks `session_type` to decide connection lifetime:
+  - non-empty → persistent connection, heartbeat liveness
+  - empty → short-lived, server closes after first job completes
+- [x] Session registry in gateway: `session_id → { client_type, sticky_pool, last_seen }`
+- [x] Session affinity (soft): first job picks a pool; all subsequent jobs on the same connection prefer that pool; falls back to least-loaded if congested
+- [x] Heartbeat: ping every 30s, cancel connection if ping fails; no idle timeout
+- [x] Session cleanup on disconnect or heartbeat failure
 
 ---
 
@@ -37,7 +37,8 @@ Items are ordered by priority. Session management is the core product feature; o
 - [ ] High-priority jobs with explicit pool tag bypassing normal queue ordering (not yet tested under load)
 - [ ] Pool routing tags: `strict` (no fallback — return 503 if named pool is missing or
       congested) and `priority-privilege` (skip congestion check, always use the named
-      pool even when busy). Currently all requests use warn+fallback by default.
+      pool even when busy). Currently all requests use soft warn+fallback. Tag would be
+      a field in the `start` message (WS) or JSON body (HTTP).
 - [ ] Docker support
 
 ---
@@ -66,6 +67,7 @@ Items are ordered by priority. Session management is the core product feature; o
 - [x] `ListeningCh` captured right after `StartRecognition` so the server's reset window overlaps with the current job's audio processing — wait is near-instant on a busy queue
 
 ### Gateway & API
+- [x] Transport-unified API: URL = transport only (`POST /v1/http`, `WS /v1/ws`); `service` field in payload routes the job
 - [x] WS inbound protocol: `start` → `ready` (backpressure) → audio chunks → `stop` → results → `done`
 - [x] `done` message sent when `ResultCh` closes — client exits immediately, no read-deadline dead time
 - [x] HTTP POST inbound for TTS

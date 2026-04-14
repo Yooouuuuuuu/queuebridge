@@ -2,9 +2,9 @@
 //
 // Usage:
 //
-//	playground stt <file.wav>       stream one WAV through /ws, print transcript
+//	playground stt <file.wav>       stream one WAV through /v1/ws, print transcript
 //	playground stt-batch            run all WAVs in testdata/stt/input/ → testdata/stt/output/*.txt
-//	playground tts <"text">         synthesize text via /tts → testdata/tts/output/<timestamp>.wav
+//	playground tts <"text">         synthesize text via /v1/http → testdata/tts/output/<timestamp>.wav
 //	playground tts-batch            synthesize every line in testdata/tts/input/sentences.txt
 package main
 
@@ -124,7 +124,7 @@ func runSTT(wavPath string) (sttResult, error) {
 			hdr.SampleRate, hdr.Channels, hdr.BitsPerSample)
 	}
 
-	conn, _, err := websocket.DefaultDialer.Dial("ws://"+gatewayAddr+"/v1/stt/stream", nil)
+	conn, _, err := websocket.DefaultDialer.Dial("ws://"+gatewayAddr+"/v1/ws", nil)
 	if err != nil {
 		return sttResult{}, fmt.Errorf("ws connect: %w", err)
 	}
@@ -138,7 +138,7 @@ func runSTT(wavPath string) (sttResult, error) {
 		return sttResult{}, fmt.Errorf("unexpected welcome: %+v", msg)
 	}
 
-	send(conn, map[string]string{"type": "start"})
+	send(conn, map[string]any{"type": "start", "service": "stt"})
 
 	// Wait for the broker to signal that a session has picked up the job.
 	// This prevents streaming audio into a buffer while the job sits in queue —
@@ -304,8 +304,8 @@ func runSTTBatch(workers int) {
 // ---- TTS ----------------------------------------------------------------
 
 func runTTS(text string) {
-	body, _ := json.Marshal(map[string]string{"text": text})
-	resp, err := http.Post("http://"+gatewayAddr+"/v1/tts", "application/json", bytes.NewReader(body))
+	body, _ := json.Marshal(map[string]string{"service": "tts", "text": text})
+	resp, err := http.Post("http://"+gatewayAddr+"/v1/http", "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Fatalf("tts request: %v", err)
 	}
@@ -372,8 +372,8 @@ func runTTSBatch(workers int) {
 			outPath := filepath.Join(ttsOutputDir, fmt.Sprintf("%04d.wav", i+1))
 			start := time.Now()
 
-			body, _ := json.Marshal(map[string]string{"text": text})
-			resp, err := http.Post("http://"+gatewayAddr+"/v1/tts", "application/json", bytes.NewReader(body))
+			body, _ := json.Marshal(map[string]string{"service": "tts", "text": text})
+			resp, err := http.Post("http://"+gatewayAddr+"/v1/http", "application/json", bytes.NewReader(body))
 			if err != nil {
 				end := time.Now()
 				fmt.Printf("[%d/%d] ERROR: %v\n", i+1, len(lines), err)
