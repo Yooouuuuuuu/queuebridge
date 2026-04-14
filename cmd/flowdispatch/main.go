@@ -19,7 +19,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: queuebridge <serve|test-stt|test-tts|test-both>")
+		fmt.Println("Usage: flowdispatch <serve|test-stt|test-tts|test-both>")
 		os.Exit(1)
 	}
 

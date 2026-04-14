@@ -232,13 +232,13 @@ All errors return JSON:
 FlowDispatch is configured with a YAML file. Copy `flowdispatch.example.yaml` to e.g. `dev.yaml`, fill in your endpoints and tokens, then pass it at startup:
 
 ```bash
-queuebridge serve --config dev.yaml
+flowdispatch serve --config dev.yaml
 ```
 
 You can maintain separate files per environment (`dev.yaml`, `prod.yaml`, …) and select one at startup. `--addr` is the only CLI override — it sets the listen address without touching the config file:
 
 ```bash
-queuebridge serve --config prod.yaml --addr :9090
+flowdispatch serve --config prod.yaml --addr :9090
 ```
 
 **Tokens belong in the config file, not in environment variables.** The 12-factor convention of one env var per secret works fine for a single service, but FlowDispatch connects to multiple backends — each pool can point to a different host with its own token. Managing a separate env var per pool (`STT_TOKEN_A`, `STT_TOKEN_B`, …) does not scale. The config file is the right place: each service entry carries its token next to its endpoint, the file is gitignored, and access is controlled by filesystem permissions. This is the same approach Prometheus uses for scrape credentials.
@@ -266,7 +266,7 @@ Precedence: **`--addr` flag > env vars > config file > built-in defaults**
 
 ```bash
 # Normal usage
-go run ./cmd/queuebridge serve --config dev.yaml
+go run ./cmd/flowdispatch serve --config dev.yaml
 
 # Single requests (uses env vars or built-in defaults for connection)
 go run ./cmd/playground stt testdata/stt/input/example.wav
@@ -282,7 +282,7 @@ go run ./cmd/playground tts-batch
 ```
 flowdispatch/
 ├── cmd/
-│   ├── queuebridge/main.go   # serve subcommand; --pool / --stt / --tts flags
+│   ├── flowdispatch/main.go   # serve subcommand; --pool / --stt / --tts flags
 │   ├── playground/main.go    # test CLI: stt, stt-batch, tts, tts-batch
 │   └── sttdebug/main.go      # direct STT backend debug tool (bypasses broker)
 ├── internal/

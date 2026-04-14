@@ -1,4 +1,4 @@
-// playground is a manual testing tool for the queuebridge gateway.
+// playground is a manual testing tool for the flowdispatch gateway.
 //
 // Usage:
 //

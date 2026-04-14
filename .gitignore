@@ -1,5 +1,5 @@
 # Binaries (root-level compiled outputs)
-/queuebridge
+/flowdispatch
 /playground
 /sttdebug
 /wstest
@@ -15,7 +15,9 @@ test_output.wav
 # Generated testdata output (transcripts, audio, and batch logs)
 testdata/stt/output/*.txt
 testdata/stt/output/*.log
-testdata/tts/output/
+testdata/tts/output/*.wav
+testdata/tts/output/*.log
+
 
 # IDE
 .idea/
