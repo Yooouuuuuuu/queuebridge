@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package streamservice;
 
-option go_package = "github.com/Yooouuuuuuu/queuebridge/proto";
+option go_package = "github.com/Yooouuuuuuu/flowdispatch/proto";
 
 message TtsRequest {
   string serviceName    = 1;  //必要，服務名稱

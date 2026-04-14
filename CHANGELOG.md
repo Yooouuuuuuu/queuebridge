@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.9.0] — 2026-04-14 — Observability
+
+### Added
+- **`GET /metrics`**: Prometheus-format endpoint exposing per-pool gauges and counters —
+  `active`, `idle`, `queued`, `conns`, `jobs_completed_total`, `jobs_errors_total` —
+  all labeled `{pool="<name>"}`. Powered by `prometheus/client_golang` with a dedicated
+  registry (no Go runtime metrics mixed in).
+- **`broker.Metrics()`**: snapshot method returning `[]PoolMetrics`; read by the metrics
+  collector on every scrape.
+- **`completed` / `errors` counters** (`atomic.Int64`) on each pool; incremented by TTS
+  and STT workers on job completion or failure.
+
+### Changed
+- Removed the 10 s status ticker (`runStatusLogger`) — pool state is now observable via
+  `/metrics` instead of log spam.
+
+---
+
 ## [0.8.0] — 2026-04-14 — gRPC Inbound Gateway
 
 ### Added

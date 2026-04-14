@@ -20,7 +20,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: flowdispatch <serve|test-stt|test-tts|test-both>")
+		fmt.Fprintf(os.Stderr, "Usage: %s <serve|test-stt|test-tts|test-both>\n", os.Args[0])
 		os.Exit(1)
 	}
 
@@ -97,7 +97,7 @@ func serveGateway(cfg *config.Config) {
 		}()
 	}
 
-	gw := gateway.New(cfg.Listen, b)
+	gw := gateway.New(cfg.Listen, cfg.AppName, b)
 	if err := gw.Start(sigCtx); err != nil {
 		log.Fatalf("gateway error: %v", err)
 	}

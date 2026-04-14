@@ -148,10 +148,23 @@ func (pq *priorityQueue) len() int {
 // ---- Pool ----
 
 type pool struct {
-	cfg    PoolConfig
-	queue  *priorityQueue
-	active atomic.Int32 // sessions currently processing audio
-	idle   atomic.Int32 // sessions connected and waiting for a job
+	cfg       PoolConfig
+	queue     *priorityQueue
+	active    atomic.Int32 // sessions currently processing audio
+	idle      atomic.Int32 // sessions connected and waiting for a job
+	completed atomic.Int64 // total jobs completed successfully
+	errors    atomic.Int64 // total jobs that returned an error
+}
+
+// PoolMetrics is a snapshot of a single pool's current counters.
+type PoolMetrics struct {
+	Name      string
+	Conns     int
+	Active    int32
+	Idle      int32
+	Queued    int
+	Completed int64
+	Errors    int64
 }
 
 // ---- Broker ----
@@ -202,7 +215,6 @@ func (b *Broker) Start(ctx context.Context) error {
 			pq.cond.Broadcast()
 		}(p.queue)
 	}
-	go b.runStatusLogger(ctx)
 	return nil
 }
 
@@ -293,8 +305,10 @@ func (b *Broker) runTTSWorker(ctx context.Context, p *pool, cli *tts.Client) {
 		p.active.Add(-1)
 
 		if err != nil {
+			p.errors.Add(1)
 			job.ResultCh <- Result{ErrCode: 1, ErrMsg: err.Error()}
 		} else {
+			p.completed.Add(1)
 			job.ResultCh <- Result{Audio: audio}
 		}
 		close(job.ResultCh)
@@ -417,7 +431,6 @@ func (b *Broker) runArmedSession(ctx context.Context, p *pool, cli *stt.Client) 
 	}()
 
 	p.idle.Add(1)
-	log.Printf("[broker] pool=%s  STT ready — idle: %d/%d", p.cfg.Name, p.idle.Load(), p.cfg.Conns)
 
 	// listeningCh tracks whether the STT server has returned to listening state.
 	// It is captured right after each StartRecognition call (which resets the
@@ -455,7 +468,6 @@ func (b *Broker) runArmedSession(ctx context.Context, p *pool, cli *stt.Client) 
 
 		p.idle.Add(-1)
 		p.active.Add(1)
-		log.Printf("[broker] pool=%s  STT job started — active: %d  idle: %d", p.cfg.Name, p.active.Load(), p.idle.Load())
 
 		// Wait for the server to confirm it is back in listening state.
 		// listeningCh was captured right after the previous StartRecognition, so
@@ -546,14 +558,15 @@ func (b *Broker) runArmedSession(ctx context.Context, p *pool, cli *stt.Client) 
 			// the next StartRecognition could race the in-flight stop on the wire.
 			<-audioDone
 			clearCallbacks(signalJobDone)
+			p.completed.Add(1)
 			close(job.ResultCh)
 			p.active.Add(-1)
 			p.idle.Add(1)
-			log.Printf("[broker] pool=%s  STT idle — active: %d  idle: %d", p.cfg.Name, p.active.Load(), p.idle.Load())
 
 		case <-time.After(30 * time.Second):
 			log.Printf("[broker] pool=%s  STT job timed out", p.cfg.Name)
 			clearCallbacks(signalJobDone)
+			p.errors.Add(1)
 			close(job.ResultCh)
 			p.active.Add(-1)
 			cancelRead()
@@ -563,6 +576,7 @@ func (b *Broker) runArmedSession(ctx context.Context, p *pool, cli *stt.Client) 
 		case err := <-connErrCh:
 			log.Printf("[broker] pool=%s  STT connection dropped: %v", p.cfg.Name, err)
 			clearCallbacks(signalJobDone)
+			p.errors.Add(1)
 			close(job.ResultCh)
 			p.active.Add(-1)
 			cancelRead()
@@ -656,20 +670,19 @@ func (b *Broker) leastLoaded(service string) (*pool, error) {
 	return best, nil
 }
 
-// ---- Status logger ----
-
-func (b *Broker) runStatusLogger(ctx context.Context) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			for name, p := range b.pools {
-				log.Printf("[broker] pool=%-12s  conns=%d  active=%d  idle=%d  queued=%d",
-					name, p.cfg.Conns, p.active.Load(), p.idle.Load(), p.queue.len())
-			}
-		}
+// Metrics returns a snapshot of all pool counters for the metrics endpoint.
+func (b *Broker) Metrics() []PoolMetrics {
+	out := make([]PoolMetrics, 0, len(b.pools))
+	for _, p := range b.pools {
+		out = append(out, PoolMetrics{
+			Name:      p.cfg.Name,
+			Conns:     p.cfg.Conns,
+			Active:    p.active.Load(),
+			Idle:      p.idle.Load(),
+			Queued:    p.queue.len(),
+			Completed: p.completed.Load(),
+			Errors:    p.errors.Load(),
+		})
 	}
+	return out
 }

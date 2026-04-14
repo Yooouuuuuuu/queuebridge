@@ -18,8 +18,8 @@ Clients        Gateway           │  │  (FIFO +    │──►│ conn 1 ─
 ───────        ───────           │  │  priority)  │   │ conn N ──► ws       │  │
 WebSocket ──┐                    │  │             │   └─────────────────────┘  │
 HTTP      ──┼──► route ──► queue─┤  │             │   ┌── Pool B ───────────┐  │
-(gRPC     ──┘    + tag           │  │             │──►│ conn 1 ──► ws       │  │
- planned)                        │  │             │   │ conn N ──► ws       │  │
+gRPC      ──┘    + tag           │  │             │──►│ conn 1 ──► ws       │  │
+                                 │  │             │   │ conn N ──► ws       │  │
                                  │  └─────────────┘   └─────────────────────┘  │
                                  │                                              │
                                  │  ┌─ TTS queue ─┐   ┌── Pool C ───────────┐  │
@@ -214,6 +214,39 @@ curl http://localhost:8080/health
 
 ---
 
+### GET /metrics
+
+Prometheus-format metrics, one line per pool per metric.
+
+```bash
+# All metrics
+curl -s http://localhost:8080/metrics
+
+# Strip comment lines (just values)
+curl -s http://localhost:8080/metrics | grep -v "^#"
+
+# Filter to one pool
+curl -s http://localhost:8080/metrics | grep stt-default
+
+# Watch live while a batch runs (refresh every 2s)
+watch -n2 'curl -s http://localhost:8080/metrics | grep -v "^#"'
+```
+
+**Metrics exposed** (all labeled `{pool="<name>"}`):
+
+The metric prefix is set by `app_name` in your config file (e.g. `app_name: "flowdispatch"` → `flowdispatch_pool_active`).
+
+| Metric | Type | Description |
+|---|---|---|
+| `<app_name>_pool_active` | gauge | Sessions currently processing a job |
+| `<app_name>_pool_idle` | gauge | Sessions connected and waiting for a job |
+| `<app_name>_pool_queued` | gauge | Jobs waiting in the priority queue |
+| `<app_name>_pool_conns` | gauge | Configured number of backend connections |
+| `<app_name>_pool_jobs_completed_total` | counter | Total jobs completed successfully |
+| `<app_name>_pool_jobs_errors_total` | counter | Total jobs that returned an error |
+
+---
+
 ### Error responses
 
 All errors return JSON:
@@ -257,7 +290,7 @@ flowdispatch serve --config dev.yaml
 You can maintain separate files per environment (`dev.yaml`, `prod.yaml`, …) and select one at startup. `--addr` is the only CLI override — it sets the listen address without touching the config file:
 
 ```bash
-flowdispatch serve --config prod.yaml --addr :9090
+flowdispatch serve --config prod.yaml --addr :8081
 ```
 
 **Tokens belong in the config file, not in environment variables.** The 12-factor convention of one env var per secret works fine for a single service, but FlowDispatch connects to multiple backends — each pool can point to a different host with its own token. Managing a separate env var per pool (`STT_TOKEN_A`, `STT_TOKEN_B`, …) does not scale. The config file is the right place: each service entry carries its token next to its endpoint, the file is gitignored, and access is controlled by filesystem permissions. This is the same approach Prometheus uses for scrape credentials.
@@ -278,6 +311,8 @@ Environment variables are available as a convenience override for single-service
 | `TTS_UID` | `tts.uid` |
 | `TTS_SPEAKER` | `tts.speaker` |
 | `TTS_LANGUAGE` | `tts.language` |
+
+The `app_name` field (Prometheus metric prefix) has no env var override — set it in the config file.
 
 Precedence: **`--addr` flag > env vars > config file > built-in defaults**
 
@@ -302,7 +337,7 @@ go run ./cmd/playground stt-batch -workers 5
 go run ./cmd/playground tts-batch -workers 5
 ```
 
-**Manual gRPC testing** (requires grpcurl — see Prerequisites):
+**Manual gRPC testing** (requires [grpcurl](https://github.com/fullstorydev/grpcurl): `go install github.com/fullstorydev/grpcurl/cmd/grpcurl@latest`):
 
 ```bash
 # List available services and methods
@@ -355,12 +390,14 @@ flowdispatch/
 │   ├── playground/main.go    # test CLI: stt, stt-batch, tts, tts-batch
 │   └── sttdebug/main.go      # direct STT backend debug tool (bypasses broker)
 ├── internal/
-│   ├── broker/broker.go      # pool registry, priority queue, worker dispatch
-│   ├── gateway/gateway.go    # inbound WS and HTTP handlers
-│   ├── stt/client.go         # WebSocket STT client with ListeningCh lifecycle
-│   └── tts/client.go         # gRPC TTS client
-├── config/config.go          # Config struct, LoadFile (YAML), env overrides
-├── proto/                    # TTS gRPC protobuf definitions
+│   ├── broker/broker.go         # pool registry, priority queue, worker dispatch
+│   ├── gateway/gateway.go       # inbound HTTP and WS handlers
+│   ├── grpcgateway/grpcgateway.go  # inbound gRPC handlers
+│   ├── metrics/metrics.go       # Prometheus /metrics collector
+│   ├── stt/client.go            # WebSocket STT client with ListeningCh lifecycle
+│   └── tts/client.go            # gRPC TTS client
+├── config/config.go             # Config struct, LoadFile (YAML), env overrides
+├── proto/                       # protobuf definitions (inbound gRPC + TTS outbound)
 └── testdata/
     ├── stt/input/            # WAV files for STT testing
     └── tts/input/            # sentence list for TTS batch testing
@@ -369,6 +406,6 @@ flowdispatch/
 ## Tech Stack
 
 - **Language:** Go 1.24
-- **Inbound:** HTTP, WebSocket (gRPC planned)
+- **Inbound:** HTTP, WebSocket, gRPC
 - **Outbound:** WebSocket (STT), gRPC (TTS)
 - **Queue:** In-memory priority queue (`container/heap` + `sync.Cond`)

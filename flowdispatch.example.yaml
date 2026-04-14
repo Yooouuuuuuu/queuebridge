@@ -1,10 +1,11 @@
-# FlowDispatch example configuration file.
+# Example configuration file.
 # Copy to e.g. dev.yaml or prod.yaml, fill in endpoint and token, then:
-#   flowdispatch serve --config dev.yaml
+#   serve --config dev.yaml
 #
 # Tokens are not included here — add them in your private copy or via env vars
 # (STT_TOKEN, TTS_TOKEN).
 
+app_name: "myapp"   # used as Prometheus metric prefix on /metrics
 listen: ":8080"
 grpc_listen: ":9090"
 

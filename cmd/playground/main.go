@@ -1,4 +1,4 @@
-// playground is a manual testing tool for the flowdispatch gateway.
+// playground is a manual testing tool for the gateway.
 //
 // Usage:
 //

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Yooouuuuuuu/flowdispatch/internal/broker"
+	"github.com/Yooouuuuuuu/flowdispatch/internal/metrics"
 	"github.com/gorilla/websocket"
 )
 
@@ -94,15 +95,18 @@ var upgrader = websocket.Upgrader{
 // Gateway handles inbound HTTP and WebSocket connections.
 type Gateway struct {
 	addr     string
+	appName  string
 	broker   *broker.Broker
 	server   *http.Server
 	sessions sessionRegistry
 }
 
 // New creates a Gateway listening on addr (e.g. ":8080").
-func New(addr string, b *broker.Broker) *Gateway {
+// appName is used as the Prometheus metric prefix on /metrics.
+func New(addr, appName string, b *broker.Broker) *Gateway {
 	return &Gateway{
 		addr:     addr,
+		appName:  appName,
 		broker:   b,
 		sessions: sessionRegistry{sessions: make(map[string]*session)},
 	}
@@ -118,6 +122,7 @@ func (g *Gateway) Start(ctx context.Context) error {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "ok")
 	})
+	mux.Handle("/metrics", metrics.Handler(g.appName, g.broker))
 
 	g.server = &http.Server{
 		Addr:    g.addr,
