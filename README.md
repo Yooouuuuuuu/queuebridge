@@ -77,16 +77,48 @@ The `ready` signal is the key backpressure point: the client does not stream aud
 | STT (Speech-to-Text) | WebSocket | configurable | working |
 | TTS (Text-to-Speech) | gRPC | configurable | working |
 
+## Configuration
+
+FlowDispatch is configured with a YAML file. Copy `testdata/flowdispatch.example.yaml` to e.g. `dev.yaml`, fill in your endpoints and tokens, then pass it at startup:
+
+```bash
+queuebridge serve --config dev.yaml
+```
+
+You can maintain separate files per environment (`dev.yaml`, `prod.yaml`, …) and select one at startup. `--addr` is the only CLI override — it sets the listen address without touching the config file:
+
+```bash
+queuebridge serve --config prod.yaml --addr :9090
+```
+
+**Tokens belong in the config file, not in environment variables.** The 12-factor convention of one env var per secret works fine for a single service, but FlowDispatch connects to multiple backends — each pool can point to a different host with its own token. Managing a separate env var per pool (`STT_TOKEN_A`, `STT_TOKEN_B`, …) does not scale. The config file is the right place: each service entry carries its token next to its endpoint, the file is gitignored, and access is controlled by filesystem permissions. This is the same approach Prometheus uses for scrape credentials.
+
+Tokens and endpoints are never hardcoded in source. `config/config.go` only contains universal defaults (listen address, TTS voice settings, etc.).
+
+Environment variables are available as a convenience override for single-service setups or CI/CD pipelines where managing a file is impractical:
+
+| Variable | Field |
+|---|---|
+| `LISTEN_ADDR` | `listen` |
+| `STT_ENDPOINT` | `stt.endpoint` |
+| `STT_TOKEN` | `stt.token` |
+| `STT_UID` | `stt.uid` |
+| `STT_DOMAIN` | `stt.domain` |
+| `TTS_ENDPOINT` | `tts.endpoint` |
+| `TTS_TOKEN` | `tts.token` |
+| `TTS_UID` | `tts.uid` |
+| `TTS_SPEAKER` | `tts.speaker` |
+| `TTS_LANGUAGE` | `tts.language` |
+
+Precedence: **`--addr` flag > env vars > config file > built-in defaults**
+
 ## Quick Start
 
 ```bash
-# Start with 2 STT connections and 1 TTS connection (shorthand flags)
-go run ./cmd/queuebridge serve --stt 2 --tts 1
+# Normal usage
+go run ./cmd/queuebridge serve --config dev.yaml
 
-# Or define pools explicitly (repeatable; name:service:protocol:conns)
-go run ./cmd/queuebridge serve --pool stt-a:stt:ws:2 --pool tts-a:tts:grpc:1
-
-# Single requests
+# Single requests (uses env vars or built-in defaults for connection)
 go run ./cmd/playground stt testdata/stt/input/example.wav
 go run ./cmd/playground tts "今天天氣真的很好"
 
@@ -108,7 +140,7 @@ flowdispatch/
 │   ├── gateway/gateway.go    # inbound WS and HTTP handlers
 │   ├── stt/client.go         # WebSocket STT client with ListeningCh lifecycle
 │   └── tts/client.go         # gRPC TTS client
-├── config/config.go          # env-based configuration
+├── config/config.go          # Config struct, LoadFile (YAML), env overrides
 ├── proto/                    # TTS gRPC protobuf definitions
 └── testdata/
     ├── stt/input/            # WAV files for STT testing

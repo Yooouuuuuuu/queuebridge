@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.5.0] — 2026-04-14 — Config File & Graceful Shutdown
+
+### Added
+- **YAML config file** (`--config <path>`): pools, listen address, and all STT/TTS
+  service settings can be defined in a file. Precedence: `--addr` flag > env vars >
+  config file > built-in defaults. See `testdata/flowdispatch.example.yaml`.
+- **Per-pool endpoint override**: `PoolConfig.Endpoint` field lets each pool point to a
+  different backend host, overriding the service-level default.
+- **Graceful shutdown on SIGTERM / SIGINT**:
+  - Gateway stops accepting new HTTP/WS connections immediately.
+  - `broker.Drain()` sets a drain flag so `Submit` rejects new jobs and idle workers
+    exit without waiting for more work.
+  - In-flight jobs run to completion; broker workers are tracked via `sync.WaitGroup`.
+  - 30-second drain timeout; forces hard stop if exceeded.
+- **Two-phase context split**: gateway uses the signal context; broker workers use a
+  separate background context so a signal does not abort active jobs.
+- `config.LoadFile(path)` and `config.PoolConfig` (moved from `broker` package).
+
+### Changed
+- `broker.PoolConfig` is now a type alias for `config.PoolConfig`; existing call sites
+  are unaffected.
+- `serveGateway` now accepts `*config.Config` instead of individual arguments.
+- Removed `--pool`, `--stt`, `--tts` CLI flags from `serve` — pools are defined in the
+  config file. Only `--config` and `--addr` remain.
+- Tokens and endpoints removed from built-in defaults in `config.go`; they must be
+  supplied via config file or env vars. Only universal defaults (listen address, TTS
+  voice settings) remain hardcoded.
+- `tts-batch` in playground now accepts `-workers N` for concurrent requests (matches
+  `stt-batch`). Verified: 514 items in 30s, 5 000 STT items in 5m22s, zero failures.
+
+---
+
 ## [0.4.0] — 2026-04-13 — Session Reliability & Backpressure
 
 ### Added

@@ -1,0 +1,37 @@
+# FlowDispatch example configuration file.
+# Copy to e.g. dev.yaml or prod.yaml, fill in endpoint and token, then:
+#   queuebridge serve --config dev.yaml
+#
+# Tokens are not included here — add them in your private copy or via env vars
+# (STT_TOKEN, TTS_TOKEN).
+
+listen: ":8080"
+
+stt:
+  endpoint: "ws://<host>:<port>/SttProxy/recognition"
+  token: "<stt-token>"
+  uid: "go-bridge-user"
+  domain: "freeSTT-zh-TW"
+
+tts:
+  endpoint: "<host>:<port>"
+  token: "<tts-token>"
+  uid: "go-bridge-user"
+  service_name: "e2e"
+  speaker: "Sharon"
+  language: "zh-TW"
+  out_format: "wav"
+  vbr_quality: 4
+  speed: 1.0
+  gain: 1.0
+
+pools:
+  - name: stt-default
+    service: stt
+    protocol: ws
+    conns: 2
+
+  - name: tts-default
+    service: tts
+    protocol: grpc
+    conns: 1

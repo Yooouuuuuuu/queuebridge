@@ -7,16 +7,16 @@ management is the core product feature; observability and gRPC follow from there
 
 ## 1 · Config file
 
-- [ ] Pool definitions from a config file (YAML or TOML): name, service, protocol, endpoint, connections
-- [ ] Load from env or config file; CLI flags remain as overrides
+- [x] Pool definitions from a config file (YAML or TOML): name, service, protocol, endpoint, connections
+- [x] Load from env or config file; CLI flags remain as overrides
 
 ---
 
 ## 2 · Graceful shutdown
 
-- [ ] Stop accepting new jobs on SIGTERM / SIGINT
-- [ ] Drain the queue: wait for all in-flight jobs to finish before exiting
-- [ ] Signal in-progress workers to complete (not abort) their current job
+- [x] Stop accepting new jobs on SIGTERM / SIGINT
+- [x] Drain the queue: wait for all in-flight jobs to finish before exiting
+- [x] Signal in-progress workers to complete (not abort) their current job
 
 ---
 

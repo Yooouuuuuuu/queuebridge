@@ -7,8 +7,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -20,8 +18,6 @@ import (
 )
 
 func main() {
-	cfg := config.Load()
-
 	if len(os.Args) < 2 {
 		fmt.Println("Usage: queuebridge <serve|test-stt|test-tts|test-both>")
 		os.Exit(1)
@@ -30,33 +26,34 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		fs := flag.NewFlagSet("serve", flag.ExitOnError)
-		addr := fs.String("addr", ":8080", "listen address")
-
-		// --pool name:service:protocol:conns  (repeatable)
-		var pools poolFlags
-		fs.Var(&pools, "pool", "pool definition: name:service:protocol:conns (repeatable)\n"+
-			"  e.g. --pool stt-a:stt:ws:2 --pool tts-a:tts:grpc:1")
-
-		// legacy shortcuts for convenience
-		sttConns := fs.Int("stt", 0, "shorthand: add a pool named 'stt-default' with N WebSocket workers")
-		ttsConns := fs.Int("tts", 0, "shorthand: add a pool named 'tts-default' with N gRPC workers")
-
+		cfgFile := fs.String("config", "", "path to YAML config file")
+		addr := fs.String("addr", "", "listen address override (e.g. :9090)")
 		fs.Parse(os.Args[2:])
 
-		if *sttConns > 0 {
-			pools = append(pools, broker.PoolConfig{Name: "stt-default", Service: "stt", Protocol: "ws", Conns: *sttConns})
-		}
-		if *ttsConns > 0 {
-			pools = append(pools, broker.PoolConfig{Name: "tts-default", Service: "tts", Protocol: "grpc", Conns: *ttsConns})
+		var cfg *config.Config
+		if *cfgFile != "" {
+			var err error
+			cfg, err = config.LoadFile(*cfgFile)
+			if err != nil {
+				log.Fatalf("config: %v", err)
+			}
+			log.Printf("[main] config loaded from %s", *cfgFile)
+		} else {
+			cfg = config.Load()
 		}
 
-		serveGateway(*addr, []broker.PoolConfig(pools))
+		if *addr != "" {
+			cfg.Listen = *addr
+		}
+
+		serveGateway(cfg)
 
 	case "test-stt":
-		testSTT(cfg)
+		testSTT(config.Load())
 	case "test-tts":
-		testTTS(cfg)
+		testTTS(config.Load())
 	case "test-both":
+		cfg := config.Load()
 		testSTT(cfg)
 		fmt.Println()
 		testTTS(cfg)
@@ -66,59 +63,43 @@ func main() {
 	}
 }
 
-// poolFlags is a repeatable --pool flag.
-type poolFlags []broker.PoolConfig
-
-func (f *poolFlags) String() string {
-	parts := make([]string, len(*f))
-	for i, p := range *f {
-		parts[i] = fmt.Sprintf("%s:%s:%s:%d", p.Name, p.Service, p.Protocol, p.Conns)
+func serveGateway(cfg *config.Config) {
+	if len(cfg.Pools) == 0 {
+		log.Println("[main] no pools configured — add a pools section to your config file")
 	}
-	return strings.Join(parts, ", ")
-}
-
-func (f *poolFlags) Set(v string) error {
-	parts := strings.SplitN(v, ":", 4)
-	if len(parts) != 4 {
-		return fmt.Errorf("pool flag must be name:service:protocol:conns, got %q", v)
-	}
-	conns, err := strconv.Atoi(parts[3])
-	if err != nil || conns <= 0 {
-		return fmt.Errorf("conns must be a positive integer, got %q", parts[3])
-	}
-	*f = append(*f, broker.PoolConfig{
-		Name:     parts[0],
-		Service:  parts[1],
-		Protocol: parts[2],
-		Conns:    conns,
-	})
-	return nil
-}
-
-func serveGateway(addr string, poolCfgs []broker.PoolConfig) {
-	if len(poolCfgs) == 0 {
-		log.Println("[main] no pools configured — use --pool or --stt/--tts flags")
-	}
-	for _, p := range poolCfgs {
+	for _, p := range cfg.Pools {
 		log.Printf("[main] pool: %-12s  service=%-4s  protocol=%-5s  conns=%d",
 			p.Name, p.Service, p.Protocol, p.Conns)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	// sigCtx is cancelled on SIGTERM/SIGINT — stops the gateway from accepting
+	// new connections and new job submissions.
+	sigCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	cfg := config.Load()
+	// brokerCtx is not tied to the signal so in-flight jobs can finish during drain.
+	brokerCtx, brokerCancel := context.WithCancel(context.Background())
+	defer brokerCancel()
 
-	b := broker.New(*cfg, poolCfgs)
-	if err := b.Start(ctx); err != nil {
+	b := broker.New(*cfg, cfg.Pools)
+	if err := b.Start(brokerCtx); err != nil {
 		log.Fatalf("broker start: %v", err)
 	}
 
-	gw := gateway.New(addr, b)
-	if err := gw.Start(ctx); err != nil {
+	gw := gateway.New(cfg.Listen, b)
+	if err := gw.Start(sigCtx); err != nil {
 		log.Fatalf("gateway error: %v", err)
 	}
-	log.Println("gateway stopped")
+
+	log.Println("[main] gateway stopped — draining in-flight jobs (30s timeout)…")
+	drainCtx, drainCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer drainCancel()
+	if err := b.Drain(drainCtx); err != nil {
+		log.Printf("[main] drain timed out (%v) — forcing shutdown", err)
+	} else {
+		log.Println("[main] all jobs drained")
+	}
+	brokerCancel()
 }
 
 func testSTT(cfg *config.Config) {

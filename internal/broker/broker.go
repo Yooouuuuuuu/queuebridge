@@ -16,6 +16,10 @@ import (
 	"github.com/Yooouuuuuuu/flowdispatch/internal/tts"
 )
 
+// PoolConfig is re-exported from the config package for callers that only
+// import broker.
+type PoolConfig = config.PoolConfig
+
 // ---- Job types ----
 
 // Job is the unified job descriptor for all services.
@@ -48,16 +52,6 @@ type Result struct {
 	ErrMsg  string
 }
 
-// ---- Pool config ----
-
-// PoolConfig describes one named pool of backend workers.
-type PoolConfig struct {
-	Name     string // unique identifier, e.g. "stt-a"
-	Service  string // "stt" | "tts"
-	Protocol string // "ws" | "grpc"
-	Conns    int    // number of persistent worker connections
-}
-
 // ---- Priority queue ----
 
 type jobItem struct {
@@ -86,7 +80,7 @@ func (h *jobHeap) Pop() any {
 }
 
 type priorityQueue struct {
-	mu  sync.Mutex
+	mu   sync.Mutex
 	cond *sync.Cond
 	h    jobHeap
 	seq  atomic.Int64
@@ -107,16 +101,19 @@ func (pq *priorityQueue) push(job Job) {
 	pq.mu.Unlock()
 }
 
-// pop blocks until a job is available or ctx is cancelled.
-// Returns (job, true) on success, (zero, false) if ctx was cancelled.
-func (pq *priorityQueue) pop(ctx context.Context) (Job, bool) {
+// pop blocks until a job is available, ctx is cancelled, or draining is true
+// and the queue is empty. Returns (job, true) on success, (zero, false) otherwise.
+func (pq *priorityQueue) pop(ctx context.Context, draining *atomic.Bool) (Job, bool) {
 	pq.mu.Lock()
 	defer pq.mu.Unlock()
 	for pq.h.Len() == 0 {
-		pq.cond.Wait()
 		if ctx.Err() != nil {
 			return Job{}, false
 		}
+		if draining.Load() {
+			return Job{}, false // drain mode: empty queue → worker should exit
+		}
+		pq.cond.Wait()
 	}
 	return heap.Pop(&pq.h).(jobItem).job, true
 }
@@ -144,6 +141,9 @@ type Broker struct {
 	cfg      config.Config
 	pools    map[string]*pool   // name → pool
 	services map[string][]*pool // service → ordered list of pools
+
+	draining atomic.Bool
+	workerWg sync.WaitGroup
 }
 
 // New creates a Broker from a list of pool configs. Call Start to connect.
@@ -176,7 +176,7 @@ func (b *Broker) Start(ctx context.Context) error {
 		default:
 			return fmt.Errorf("unknown service %q in pool %q", p.cfg.Service, p.cfg.Name)
 		}
-		// wake blocked workers when ctx ends
+		// Wake blocked workers when ctx ends (hard stop).
 		go func(pq *priorityQueue) {
 			<-ctx.Done()
 			pq.cond.Broadcast()
@@ -186,12 +186,40 @@ func (b *Broker) Start(ctx context.Context) error {
 	return nil
 }
 
+// Drain stops accepting new jobs and waits for all in-flight workers to finish
+// their current job before returning. ctx controls the wait deadline; cancel it
+// to force workers to exit immediately.
+func (b *Broker) Drain(ctx context.Context) error {
+	b.draining.Store(true)
+	// Wake all idle workers so they see the drain flag and exit.
+	for _, p := range b.pools {
+		p.queue.cond.Broadcast()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		b.workerWg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // ---- TTS pool ----
 
 func (b *Broker) startTTSPool(ctx context.Context, p *pool) error {
+	endpoint := b.cfg.TTS.Endpoint
+	if p.cfg.Endpoint != "" {
+		endpoint = p.cfg.Endpoint
+	}
 	for i := range p.cfg.Conns {
 		cli := tts.NewClient(tts.Config{
-			Endpoint:    b.cfg.TTS.Endpoint,
+			Endpoint:    endpoint,
 			Token:       b.cfg.TTS.Token,
 			UID:         b.cfg.TTS.UID,
 			ServiceName: b.cfg.TTS.ServiceName,
@@ -209,7 +237,11 @@ func (b *Broker) startTTSPool(ctx context.Context, p *pool) error {
 			return fmt.Errorf("pool %q TTS[%d] connect: %w", p.cfg.Name, i, err)
 		}
 		log.Printf("[broker] pool=%s  TTS[%d] connected", p.cfg.Name, i)
-		go b.runTTSWorker(ctx, p, cli)
+		b.workerWg.Add(1)
+		go func() {
+			defer b.workerWg.Done()
+			b.runTTSWorker(ctx, p, cli)
+		}()
 	}
 	return nil
 }
@@ -217,9 +249,9 @@ func (b *Broker) startTTSPool(ctx context.Context, p *pool) error {
 func (b *Broker) runTTSWorker(ctx context.Context, p *pool, cli *tts.Client) {
 	defer cli.Close()
 	for {
-		job, ok := p.queue.pop(ctx)
+		job, ok := p.queue.pop(ctx, &b.draining)
 		if !ok {
-			return // ctx cancelled
+			return
 		}
 		payload, ok := job.Payload.(*TTSPayload)
 		if !ok {
@@ -244,21 +276,29 @@ func (b *Broker) runTTSWorker(ctx context.Context, p *pool, cli *tts.Client) {
 // ---- STT pool ----
 
 func (b *Broker) startSTTPool(ctx context.Context, p *pool) error {
+	endpoint := b.cfg.STT.Endpoint
+	if p.cfg.Endpoint != "" {
+		endpoint = p.cfg.Endpoint
+	}
 	for i := range p.cfg.Conns {
-		cli, err := b.dialSTT(ctx, p.cfg.Name)
+		cli, err := b.dialSTT(ctx, p.cfg.Name, endpoint)
 		if err != nil {
 			return err
 		}
 		log.Printf("[broker] pool=%s  STT[%d] connected", p.cfg.Name, i)
-		go b.runSTTWorker(ctx, p, cli)
+		b.workerWg.Add(1)
+		go func() {
+			defer b.workerWg.Done()
+			b.runSTTWorker(ctx, p, cli, endpoint)
+		}()
 	}
 	return nil
 }
 
-func (b *Broker) dialSTT(ctx context.Context, poolName string) (*stt.Client, error) {
+func (b *Broker) dialSTT(ctx context.Context, poolName, endpoint string) (*stt.Client, error) {
 	for {
 		cli := stt.NewClient(stt.Config{
-			Endpoint: b.cfg.STT.Endpoint,
+			Endpoint: endpoint,
 			Token:    b.cfg.STT.Token,
 			UID:      b.cfg.STT.UID,
 			Domain:   b.cfg.STT.Domain,
@@ -278,17 +318,18 @@ func (b *Broker) dialSTT(ctx context.Context, poolName string) (*stt.Client, err
 
 // runSTTWorker keeps a persistent STT session alive for this pool slot.
 // StartRecognition is called once per job, just before streaming begins.
-// On connection drop or StartRecognition failure, it reconnects.
-func (b *Broker) runSTTWorker(ctx context.Context, p *pool, cli *stt.Client) {
+// On connection drop or StartRecognition failure, it reconnects — unless
+// draining, in which case it exits without reconnecting.
+func (b *Broker) runSTTWorker(ctx context.Context, p *pool, cli *stt.Client, endpoint string) {
 	for {
 		dropped := b.runArmedSession(ctx, p, cli)
 		cli.Close()
-		if !dropped || ctx.Err() != nil {
+		if !dropped || ctx.Err() != nil || b.draining.Load() {
 			return
 		}
 		log.Printf("[broker] pool=%s  STT reconnecting…", p.cfg.Name)
 		var err error
-		cli, err = b.dialSTT(ctx, p.cfg.Name)
+		cli, err = b.dialSTT(ctx, p.cfg.Name, endpoint)
 		if err != nil {
 			return // ctx cancelled
 		}
@@ -369,12 +410,12 @@ func (b *Broker) runArmedSession(ctx context.Context, p *pool, cli *stt.Client) 
 	}
 
 	for {
-		job, ok := p.queue.pop(ctx)
+		job, ok := p.queue.pop(ctx, &b.draining)
 		if !ok {
 			p.idle.Add(-1)
 			cancelRead()
 			<-readDone
-			return false // ctx cancelled, clean exit
+			return false // ctx cancelled or draining with empty queue — clean exit
 		}
 
 		payload, ok := job.Payload.(*STTPayload)
@@ -514,9 +555,12 @@ func (b *Broker) runArmedSession(ctx context.Context, p *pool, cli *stt.Client) 
 // ---- Routing ----
 
 // Submit enqueues a job. Always succeeds (blocking submit, no rejection).
-// Returns an error only if the target pool doesn't exist or no pool serves
-// the requested service.
+// Returns an error only if the target pool doesn't exist, no pool serves the
+// requested service, or the broker is draining.
 func (b *Broker) Submit(job Job) error {
+	if b.draining.Load() {
+		return fmt.Errorf("server is shutting down")
+	}
 	p, err := b.resolvePool(job)
 	if err != nil {
 		return err

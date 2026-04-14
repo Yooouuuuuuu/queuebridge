@@ -1,50 +1,64 @@
 package config
 
 import (
+	"fmt"
 	"os"
+
+	"gopkg.in/yaml.v3"
 )
 
-// Config holds the application configuration
+// Config holds the application configuration.
 type Config struct {
-	STT STTConfig
-	TTS TTSConfig
+	Listen string      `yaml:"listen"`
+	STT    STTConfig   `yaml:"stt"`
+	TTS    TTSConfig   `yaml:"tts"`
+	Pools  []PoolConfig `yaml:"pools"`
 }
 
-// STTConfig holds STT service configuration
+// PoolConfig describes one named pool of backend workers.
+// Defined here (not in broker) so config files and the broker share one type.
+type PoolConfig struct {
+	Name     string `yaml:"name"`
+	Service  string `yaml:"service"`   // "stt" | "tts"
+	Protocol string `yaml:"protocol"`  // "ws"  | "grpc"
+	Endpoint string `yaml:"endpoint"`  // overrides service-level endpoint when non-empty
+	Conns    int    `yaml:"conns"`
+}
+
+// STTConfig holds STT service configuration.
 type STTConfig struct {
-	Endpoint string
-	Token    string
-	UID      string
-	Domain   string
+	Endpoint string `yaml:"endpoint"`
+	Token    string `yaml:"token"`
+	UID      string `yaml:"uid"`
+	Domain   string `yaml:"domain"`
 }
 
-// TTSConfig holds TTS service configuration
+// TTSConfig holds TTS service configuration.
 type TTSConfig struct {
-	Endpoint    string
-	Token       string
-	UID         string
-	ServiceName string
-	Speaker     string
-	Language    string
-	OutFormat   string
-	VBRQuality  int64
-	Speed       float32
-	Gain        float32
+	Endpoint    string  `yaml:"endpoint"`
+	Token       string  `yaml:"token"`
+	UID         string  `yaml:"uid"`
+	ServiceName string  `yaml:"service_name"`
+	Speaker     string  `yaml:"speaker"`
+	Language    string  `yaml:"language"`
+	OutFormat   string  `yaml:"out_format"`
+	VBRQuality  int64   `yaml:"vbr_quality"`
+	Speed       float32 `yaml:"speed"`
+	Gain        float32 `yaml:"gain"`
 }
 
-// DefaultConfig returns configuration with default values
-func DefaultConfig() *Config {
+// defaults returns a Config populated with built-in defaults.
+// Endpoints and tokens are intentionally empty — they are environment-specific
+// and must be supplied via a config file or environment variables.
+func defaults() *Config {
 	return &Config{
+		Listen: ":8080",
 		STT: STTConfig{
-			Endpoint: "ws://10.1.8.174:8890/SttProxy/recognition",
-			Token:    getEnv("STT_TOKEN", "g9GzWBorWT9in7xIg79xhxWo9I3aNgczEPGsLNWFtX21sIoP7lFCOJ3JzZdiU0z7OV9Jt8mO-ZtVqfHH3N1RftmCKnehSkHdDur3-tz1hSo14JjGKrBIq2X8zbE69fHo"),
-			UID:      getEnv("STT_UID", "go-bridge-user"),
-			Domain:   "freeSTT-zh-TW",
+			UID:    "go-bridge-user",
+			Domain: "freeSTT-zh-TW",
 		},
 		TTS: TTSConfig{
-			Endpoint:    "10.1.8.174:8088",
-			Token:       getEnv("TTS_TOKEN", "qfGfDLk8LoH6BrBQymcnrIvgCv-qeZqIrmAuuqJWSoPo7DNr_gtIjRtKPt2eQcYcYqQtTy9Jws-fnCH9_Sb2Y_cUk9pQUbgc2iww07FULCfXTf7BciUSltAMqIZhk5pa"),
-			UID:        getEnv("TTS_UID", "go-bridge-user"),
+			UID:         "go-bridge-user",
 			ServiceName: "e2e",
 			Speaker:     "Sharon",
 			Language:    "zh-TW",
@@ -56,11 +70,39 @@ func DefaultConfig() *Config {
 	}
 }
 
-// Load loads configuration from environment variables with defaults
+// Load returns configuration built from built-in defaults overlaid with
+// environment variables.
 func Load() *Config {
-	cfg := DefaultConfig()
+	cfg := defaults()
+	applyEnv(cfg)
+	return cfg
+}
 
-	// Override with environment variables if set
+// LoadFile reads a YAML config file and returns the merged result:
+// built-in defaults → file values → environment variable overrides.
+func LoadFile(path string) (*Config, error) {
+	cfg := defaults()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config %q: %w", path, err)
+	}
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("parse config %q: %w", path, err)
+	}
+	applyEnv(cfg)
+	return cfg, nil
+}
+
+// DefaultConfig returns a Config with built-in defaults.
+// Deprecated: use Load.
+func DefaultConfig() *Config { return defaults() }
+
+// applyEnv overlays non-empty environment variables onto cfg.
+func applyEnv(cfg *Config) {
+	if v := os.Getenv("LISTEN_ADDR"); v != "" {
+		cfg.Listen = v
+	}
+
 	if v := os.Getenv("STT_ENDPOINT"); v != "" {
 		cfg.STT.Endpoint = v
 	}
@@ -89,13 +131,5 @@ func Load() *Config {
 	if v := os.Getenv("TTS_LANGUAGE"); v != "" {
 		cfg.TTS.Language = v
 	}
-
-	return cfg
 }
 
-func getEnv(key, defaultValue string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return defaultValue
-}
